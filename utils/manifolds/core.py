@@ -40,6 +40,7 @@ def decoder_point_metric(model, z):
     Replace this with your actual metric function.
     """
     l_dim = z.shape[0]
+    G = None
     try:
         J = compute_decoder_jacobian(model, z)
         i_dim = J.shape[2]
@@ -173,9 +174,6 @@ def geodesic_equation(t, y, metric_function):
     return np.concatenate([velocity, acceleration])
 
 
-
-
-
 def geodesic_distance(z0, z1, metric, t_span=(0, 1), num_points=100):
     """
     Approximates the Riemannian distance between z0 and z1 by solving a shooting problem.
@@ -187,9 +185,12 @@ def geodesic_distance(z0, z1, metric, t_span=(0, 1), num_points=100):
     n = len(z0)
     t_eval = np.linspace(*t_span, num_points)
 
+    def local_geodesic_solve(t,y):
+        return geodesic_equation(t, y, metric)
+
     def shooting_loss(v0):
         y0 = np.concatenate((z0, v0))
-        sol = solve_ivp(geodesic_equation, t_span, y0, t_eval=t_eval, rtol=1e-6, atol=1e-8)
+        sol = solve_ivp(local_geodesic_solve, t_span, y0, t_eval=t_eval, rtol=1e-6, atol=1e-8)
         z_traj = sol.y[:n, :]
         z_end = z_traj[:, -1]
         return np.sum((z_end - z1) ** 2)  # squared distance between endpoint and z1
@@ -202,7 +203,7 @@ def geodesic_distance(z0, z1, metric, t_span=(0, 1), num_points=100):
 
     # Integrate geodesic with optimal v
     y0 = np.concatenate((z0, v_opt))
-    sol = solve_ivp(geodesic_equation, t_span, y0, t_eval=t_eval, method='RK23', rtol=1e-3, atol=1e-5)
+    sol = solve_ivp(local_geodesic_solve, t_span, y0, t_eval=t_eval, method='RK23', rtol=1e-3, atol=1e-5)
     z_traj = sol.y[:n, :]
     v_traj = sol.y[n:, :]
 

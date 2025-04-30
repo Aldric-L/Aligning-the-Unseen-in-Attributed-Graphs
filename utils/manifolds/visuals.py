@@ -5,7 +5,7 @@ import matplotlib.colors as colors
 import numpy as np
 from sklearn.manifold import MDS
 
-from core import compute_gaussian_curvature, compute_geodesic
+from utils.manifolds.core import compute_gaussian_curvature, compute_geodesic
 
 def visualize_manifold_embedding(data_points, riemannian_distances_matrix):
     """
