@@ -293,11 +293,11 @@ def plot_geodesic_grid(metric_function, curvature, Z1, Z2, grid_size=3):
         cmap = 'RdBu_r'
     
     # Plot curvature heatmap
-    im = ax.pcolormesh(Z1, Z2, curvature, cmap=cmap, norm=norm, shading='auto', alpha=0.4)
+    im = ax.pcolormesh(Z1, Z2, curvature, cmap=cmap, norm=norm, shading='auto', alpha=0.8)
     
     # Create a grid of start points
-    x_min, x_max = np.min(Z1), np.max(Z1)
-    y_min, y_max = np.min(Z2), np.max(Z2)
+    x_min, x_max = np.min(Z1)/1.2, np.max(Z1)/1.2
+    y_min, y_max = np.min(Z2)/1.2, np.max(Z2)/1.2
     
     x_points = np.linspace(x_min, x_max, grid_size)
     y_points = np.linspace(y_min, y_max, grid_size)

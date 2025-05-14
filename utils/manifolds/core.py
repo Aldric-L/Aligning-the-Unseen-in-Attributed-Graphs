@@ -33,11 +33,10 @@ def compute_metric_tensor(jacobian, input_dim, latent_dim):
 
 def decoder_point_metric(model, z):
     """
-    Example metric function.
+    Wrapper to compute the Riemannian metric from the jacobian matrix
     z: numpy array with shape (n,)
     
     Returns an (n x n) metric tensor.
-    Replace this with your actual metric function.
     """
     l_dim = z.shape[0]
     G = None
