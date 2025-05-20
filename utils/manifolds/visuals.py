@@ -61,8 +61,13 @@ def visualize_manifold_curvature(metric_function, z_range=(-3, 3), resolution=30
         labels: Optional array of integer labels for the data points
     """
     # Create a grid of points in latent space
-    z1 = np.linspace(z_range[0], z_range[1], resolution)
-    z2 = np.linspace(z_range[0], z_range[1], resolution)
+    z_range = np.array(z_range)
+    if z_range.shape[0] == 1:
+        z1 = np.linspace(z_range[0], z_range[1], resolution)
+        z2 = np.linspace(z_range[0], z_range[1], resolution)
+    else:
+        z1 = np.linspace(z_range[0][0], z_range[0][1], resolution)
+        z2 = np.linspace(z_range[1][0], z_range[1][1], resolution)
     Z1, Z2 = np.meshgrid(z1, z2)
     
     # Initialize array to store curvature values

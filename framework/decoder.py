@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Tuple, Optional, Union
+from typing import List, Dict, Any, Tuple, Optional, Union, Callable
 
 from framework.utils import heat_kernel_distance, get_adjacency_matrix_from_tensors
 
@@ -55,12 +55,14 @@ class AdjacencyDecoder(DecoderBase):
         hidden_dims: List[int] = [64, 32],
         dropout: float = 0.1, 
         activation=nn.ReLU(),
+        final_activation: Optional[Callable] = None,
         name: str = "adj_decoder"
     ):
         super(AdjacencyDecoder, self).__init__(latent_dim, name)
         
         self.dropout = dropout
         self.activation = activation
+        self.final_activation = final_activation
         
         # Build MLP layers
         layers = []
@@ -94,7 +96,11 @@ class AdjacencyDecoder(DecoderBase):
             z_src = z[src]
             z_dst = z[dst]
             edge_features = torch.cat([z_src, z_dst], dim=1)
-            edge_logits = self.activation(self.mlp(edge_features)).squeeze(-1)
+            edge_logits = (self.mlp(edge_features)).squeeze(-1)
+            
+            # Apply final activation if specified
+            if self.final_activation is not None:
+                edge_logits = self.final_activation(edge_logits)
             
             return {
                 "edge_logits": edge_logits,
@@ -112,8 +118,12 @@ class AdjacencyDecoder(DecoderBase):
             pair_features = torch.cat([z_i, z_j], dim=1)
             
             # Predict all pairwise edge probabilities
-            edge_logits = self.activation(self.mlp(pair_features)).squeeze(-1)
+            edge_logits = (self.mlp(pair_features)).squeeze(-1)
             adj_logits = edge_logits.view(batch_size, batch_size)
+            
+            # Apply final activation if specified
+            if self.final_activation is not None:
+                adj_logits = self.final_activation(adj_logits)
             
             return {
                 "adj_logits": adj_logits
@@ -244,6 +254,7 @@ class NodeAttributeDecoder(DecoderBase):
         hidden_dims: List[int] = [64, 32],
         dropout: float = 0.1, 
         activation=nn.ReLU(),
+        final_activation: Optional[Callable] = None,
         name: str = "node_attr_decoder"
     ):
         super(NodeAttributeDecoder, self).__init__(latent_dim, name)
@@ -251,6 +262,7 @@ class NodeAttributeDecoder(DecoderBase):
         self.output_dim = output_dim
         self.dropout = dropout
         self.activation = activation
+        self.final_activation = final_activation
         
         # Build MLP layers
         layers = []
@@ -275,7 +287,11 @@ class NodeAttributeDecoder(DecoderBase):
         Returns:
             Dict with node feature predictions
         """
-        node_features = (self.mlp(z))
+        node_features = self.mlp(z)
+        
+        # Apply final activation if specified
+        if self.final_activation is not None:
+            node_features = self.final_activation(node_features)
         
         return {
             "node_features": node_features

@@ -19,9 +19,9 @@ def import_dataset_fromSMS(path):
                 try:
                     sim_integer = int(integer_str)
                     # Add the integer to the dictionary with a None value
-                    adj = np.array(import_matrix_from_csv_numpy(f"data/SMS/sim_{sim_integer}/SMS-Save-OptimalGraph-{sim_integer}.csv"))
+                    adj = np.array(import_matrix_from_csv_numpy(f"{path}/sim_{sim_integer}/SMS-Save-OptimalGraph-{sim_integer}.csv"))
                     adj = adj[0:(adj.shape[1]), :]
-                    p = extract_p_vectors_by_agentid(f"data/SMS/sim_{sim_integer}/SMS-Save-Vertices-{sim_integer}.csv")
+                    p = extract_p_vectors_by_agentid(f"{path}/sim_{sim_integer}/SMS-Save-Vertices-{sim_integer}.csv")
                     sim_folders_dict[sim_integer] = dict(
                         adjacency_matrix=adj,
                         p_array=np.array(list(p.values()))
