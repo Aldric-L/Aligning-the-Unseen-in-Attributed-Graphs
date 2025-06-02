@@ -89,7 +89,7 @@ class Encoder(nn.Module):
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
         
-        return mu, logvar
+        return mu.requires_grad_(True), logvar.requires_grad_(True)
 
 class MLPEncoder(nn.Module):
     """

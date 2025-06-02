@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import List, Dict, Any, Tuple, Optional, Union
+from typing import Dict, List, Optional, Tuple, Any, Callable
 import torch.optim as optim
 from tqdm import tqdm
 
@@ -80,6 +80,7 @@ class KLAnnealingScheduler:
             weight = self.kl_weight  # No annealing
         
         return weight * self.kl_weight
+
 
 class GraphVAE(nn.Module):
     """
@@ -205,7 +206,8 @@ class GraphVAE(nn.Module):
         outputs: Dict[str, Any], 
         targets: Dict[str, Dict[str, torch.Tensor]],
         decoder_weights: Optional[Dict[str, float]] = None,
-        active_decoders: Optional[List[str]] = None
+        active_decoders: Optional[List[str]] = None,
+        use_custom_losses: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
         Compute total loss from VAE components
@@ -215,6 +217,7 @@ class GraphVAE(nn.Module):
             targets: Target values for each decoder
             decoder_weights: Optional weights for each decoder loss
             active_decoders: Optional list of decoder names to include in loss computation
+            use_custom_losses: Whether to include custom decoder losses
             
         Returns:
             Dict with total loss and component losses
@@ -236,7 +239,10 @@ class GraphVAE(nn.Module):
         
         # Compute individual decoder losses
         decoder_losses = {}
+        detailed_losses = {}
         weighted_recon_loss = 0
+        
+        z = outputs["z"]  # Get latent variables for custom losses
         
         for decoder in self.decoders:
             name = decoder.name
@@ -247,8 +253,17 @@ class GraphVAE(nn.Module):
             decoder_outputs = outputs["outputs"][name]
             decoder_targets = targets.get(name, {})
             
-            # Compute loss for this decoder
-            decoder_loss = decoder.compute_loss(decoder_outputs, decoder_targets)
+            # Compute loss for this decoder (including custom losses if enabled)
+            if use_custom_losses and hasattr(decoder, 'compute_total_loss'):
+                loss_breakdown = decoder.compute_total_loss(
+                    decoder_outputs, decoder_targets, z=z
+                )
+                decoder_loss = loss_breakdown['total']
+                detailed_losses[name] = loss_breakdown
+            else:
+                decoder_loss = decoder.compute_loss(decoder_outputs, decoder_targets)
+                detailed_losses[name] = {'base_loss': decoder_loss, 'total': decoder_loss}
+            
             decoder_losses[name] = decoder_loss
             
             # Add weighted loss to total reconstruction loss
@@ -263,7 +278,8 @@ class GraphVAE(nn.Module):
             "kl_loss": kl_loss,
             "kl_weight": kl_weight,
             "recon_loss": weighted_recon_loss,
-            "decoder_losses": decoder_losses
+            "decoder_losses": decoder_losses,
+            "detailed_losses": detailed_losses
         }
     
     def add_decoder(self, decoder: "DecoderBase"):
@@ -334,3 +350,58 @@ class GraphVAE(nn.Module):
             return decoder.compute_jacobian(z, node_idx)
         else:
             raise NotImplementedError(f"Decoder '{decoder_name}' does not implement compute_jacobian method")
+    
+    # Convenience methods for managing custom losses
+    def add_custom_loss_to_decoder(self, decoder_name: str, loss_name: str, 
+                                  loss_fn: Callable, weight: float = 1.0):
+        """
+        Add a custom loss to a specific decoder
+        
+        Args:
+            decoder_name: Name of the decoder
+            loss_name: Name for the custom loss
+            loss_fn: Loss function
+            weight: Weight for the loss
+        """
+        decoder = self.get_decoder(decoder_name)
+        if decoder is None:
+            raise ValueError(f"Decoder '{decoder_name}' not found")
+        decoder.add_custom_loss(loss_name, loss_fn, weight)
+    
+    def remove_custom_loss_from_decoder(self, decoder_name: str, loss_name: str):
+        """
+        Remove a custom loss from a specific decoder
+        
+        Args:
+            decoder_name: Name of the decoder
+            loss_name: Name of the custom loss to remove
+        """
+        decoder = self.get_decoder(decoder_name)
+        if decoder is not None:
+            decoder.remove_custom_loss(loss_name)
+    
+    def set_custom_loss_active(self, decoder_name: str, loss_name: str, active: bool = True):
+        """
+        Activate/deactivate a custom loss for a specific decoder
+        
+        Args:
+            decoder_name: Name of the decoder
+            loss_name: Name of the custom loss
+            active: Whether the loss should be active
+        """
+        decoder = self.get_decoder(decoder_name)
+        if decoder is not None:
+            decoder.set_custom_loss_active(loss_name, active)
+    
+    def set_custom_loss_weight(self, decoder_name: str, loss_name: str, weight: float):
+        """
+        Update the weight of a custom loss for a specific decoder
+        
+        Args:
+            decoder_name: Name of the decoder
+            loss_name: Name of the custom loss
+            weight: New weight value
+        """
+        decoder = self.get_decoder(decoder_name)
+        if decoder is not None:
+            decoder.set_custom_loss_weight(loss_name, weight)

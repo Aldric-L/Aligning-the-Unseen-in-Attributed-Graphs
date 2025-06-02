@@ -224,7 +224,7 @@ def train_model(
             # Prepare targets
             targets = {
                 "adj_decoder": {
-                    "adjacency_matrix": adjacency_matrix,
+                    "adj_matrix": adjacency_matrix,
                     "edge_labels": edge_labels,
                     "edge_index": edge_index
                 },
@@ -549,7 +549,7 @@ def train_phase2(
             # Prepare targets
             targets = {
                 "adj_decoder": {
-                    "adjacency_matrix": adjacency_matrix,
+                    "adj_matrix": adjacency_matrix,
                     "edge_labels": edge_labels,
                     "edge_index": edge_index
                 },
