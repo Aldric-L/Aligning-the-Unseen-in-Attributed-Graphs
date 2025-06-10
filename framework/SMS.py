@@ -2,6 +2,10 @@ import csv
 import numpy as np
 import os
 import gc
+import igraph as ig
+import matplotlib.pyplot as plt # igraph can use matplotlib for plotting
+import matplotlib.cm as cm # Import colormap module
+
 
 def import_dataset_fromSMS(path):
     sim_folders_dict = {}
@@ -145,12 +149,6 @@ def extract_p_vectors_by_agentid(csv_filepath):
         print(f"An error occurred: {e}")
 
     return p_vectors_by_agentid
-
-
-import numpy as np
-import igraph as ig
-import matplotlib.pyplot as plt # igraph can use matplotlib for plotting
-import matplotlib.cm as cm # Import colormap module
 
 def plot_graph_from_adjacency_matrix(adjacency_matrix, node_labels=None, node_color_scalars=None, cmap='viridis'):
   """
