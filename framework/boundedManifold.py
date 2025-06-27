@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Callable
 from itertools import product
 from scipy.integrate import solve_ivp # New import for solving differential equations
 from tqdm import tqdm # New import for progress bars
@@ -837,7 +837,10 @@ class BoundedManifold:
         # 1. 2D heatmap
         ax1 = fig.add_subplot(131)
         im = ax1.pcolormesh(Z1, Z2, curvature, cmap=cmap, norm=norm, shading='auto')
-        ax1.set_title('Manifold True Gaussian Curvature (2D View)')
+        if exact_mode:
+            ax1.set_title('Manifold True Gaussian Curvature (2D View)')
+        else:
+            ax1.set_title('Manifold approx. Gaussian Curvature (2D View)')
         ax1.set_xlabel('z1')
         ax1.set_ylabel('z2')
         plt.colorbar(im, ax=ax1, label='Curvature')
@@ -855,7 +858,10 @@ class BoundedManifold:
         # 3. Contour plot
         ax3 = fig.add_subplot(133)
         contour = ax3.contourf(Z1, Z2, curvature, 20, cmap=cmap, norm=norm)
-        ax3.set_title('Manifold True Gaussian Curvature (Contour Plot)')
+        if exact_mode:
+            ax3.set_title('Manifold True Gaussian Curvature (Contour Plot)')
+        else:
+            ax3.set_title('Manifold approx. Gaussian Curvature (Contour Plot)')
         ax3.set_xlabel('z1')
         ax3.set_ylabel('z2')
         plt.colorbar(contour, ax=ax3, label='Curvature')
@@ -911,7 +917,10 @@ class BoundedManifold:
                 try:
                     # Clamp data point for safety before computing curvature
                     clamped_point = self._clamp_point_to_bounds(point)
-                    data_curvatures[i] = self.compute_true_gaussian_curvature(clamped_point, h=h_curvature)
+                    if exact_mode:
+                        data_curvatures[i] = self.compute_true_gaussian_curvature(clamped_point, h=h_curvature)
+                    else:
+                        data_curvatures[i] = self.compute_gaussian_curvature(self.metric_tensor(clamped_z))*1.05
                 except (ValueError, RuntimeError) as e:
                     print(f"Error computing curvature for data point {i} ({point}): {e}. Setting to NaN.")
                     data_curvatures[i] = np.nan

@@ -1208,7 +1208,6 @@ class LatentDistanceDecoder(DecoderBase):
         distance_mode: str = "linear_interpolation",  # or "direct"
         num_integration_points: int = 10,
         metric_regularization: float = 1e-6,
-        distance_weight: float = 1.0,
         cache_jacobians: bool = True,
         name: str = "latent_distance_decoder"
     ):
@@ -1218,7 +1217,6 @@ class LatentDistanceDecoder(DecoderBase):
         self.distance_mode = distance_mode
         self.num_integration_points = num_integration_points
         self.metric_regularization = metric_regularization
-        self.distance_weight = distance_weight
         self.cache_jacobians = cache_jacobians
         
         # Cache for Jacobian computations
@@ -1519,7 +1517,7 @@ class LatentDistanceDecoder(DecoderBase):
         # Normalize by number of edges and apply weight
         if num_edges > 0:
             avg_distance = total_distance / num_edges
-            loss = self.distance_weight * avg_distance
+            loss = avg_distance
         else:
             # No edges found - return zero loss
             loss = torch.tensor(0.0, device=z.device, requires_grad=True)
@@ -1565,7 +1563,6 @@ class LatentDistanceDecoder(DecoderBase):
         distance_mode: str = "linear_interpolation",  # or "direct"
         num_integration_points: int = 10,
         metric_regularization: float = 1e-6,
-        distance_weight: float = 1.0,
         cache_jacobians: bool = True,
         # Simple caching parameters
         cache_tolerance: float = 1e-4,  # How close points need to be to reuse cache
@@ -1578,7 +1575,6 @@ class LatentDistanceDecoder(DecoderBase):
         self.distance_mode = distance_mode
         self.num_integration_points = num_integration_points
         self.metric_regularization = metric_regularization
-        self.distance_weight = distance_weight
         self.cache_jacobians = cache_jacobians
         self.cache_tolerance = cache_tolerance
         self.max_cache_size = max_cache_size
@@ -1804,79 +1800,116 @@ class LatentDistanceDecoder(DecoderBase):
                 z[node_i], z[node_j], z, node_i, node_j
             )
     
-    def compute_loss(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        negative_distance_weight: float = 1,
+    ) -> torch.Tensor:
         """
-        Compute loss based on pairwise distances between connected nodes.
-        The loss sums up the estimated distances for all existing edges in the graph.
+        Compute loss based on:
+        - Pairwise distances between connected nodes (positive edges)
+        - Penalty for non-connected nodes being too close in the latent space (negative edges)
         """
         z = outputs["latent_codes"]
         
-        # Clear cache at the beginning of each loss computation
+        # Clear cache
         if not self._cache_valid:
             self._jacobian_cache.clear()
             self._cache_valid = True
         
-        total_distance = 0.0
-        num_edges = 0
-        
-        # Check if we have edge_index (sparse format) or adj_matrix (dense format)
+        total_pos_distance = 0.0
+        total_neg_penalty = 0.0
+        num_pos_edges = 0
+
+        edge_set = set()  # To avoid sampling existing edges as negatives
+
         if "edge_index" in targets:
-            # Sparse format - use edge_index
             edge_index = targets["edge_index"]
+            num_negative_samples = edge_index.size(1)
             edge_labels = targets.get("edge_labels", None)
-            
             src_nodes, dst_nodes = edge_index[0], edge_index[1]
             
-            # Iterate through all edges
-            for idx in tqdm(range(edge_index.size(1))):
+            for idx in tqdm(range(edge_index.size(1)), desc="Positive Edges"):
                 src_idx = src_nodes[idx].item()
                 dst_idx = dst_nodes[idx].item()
                 
-                # Skip self-loops if desired
                 if src_idx == dst_idx:
                     continue
+
+                edge_set.add((src_idx, dst_idx))
+                edge_set.add((dst_idx, src_idx))  # Undirected
                 
-                # Check if this edge exists (if edge_labels provided)
                 if edge_labels is not None:
                     edge_weight = edge_labels[idx].item()
-                    if edge_weight <= 0:  # Skip non-existing edges
+                    if edge_weight <= 0:
                         continue
                 else:
-                    edge_weight = 1.0  # Assume all edges in edge_index exist
+                    edge_weight = 1.0
                 
-                # Compute distance between connected nodes
                 distance = self.compute_pairwise_distance(z, src_idx, dst_idx)
-                total_distance += edge_weight * distance
-                num_edges += edge_weight
-        
+                total_pos_distance += edge_weight * distance
+                num_pos_edges += edge_weight
+
+            # Sample negative edges (no connection in edge_index)
+            num_nodes = z.size(0)
+            neg_samples = 0
+            with tqdm(total=num_negative_samples, desc="Negative Sampling") as pbar:
+                while neg_samples < num_negative_samples:
+                    i = torch.randint(0, num_nodes, (1,)).item()
+                    j = torch.randint(0, num_nodes, (1,)).item()
+                    if i == j or (i, j) in edge_set:
+                        continue
+                    distance = self.compute_pairwise_distance(z, i, j)
+                    penalty = 1.0 / (1.0 + (distance)**2)
+                    total_neg_penalty += penalty
+                    neg_samples += 1
+                    pbar.update(1)
+
         elif "adj_matrix" in targets:
-            # Dense format - use adjacency matrix
             adj_matrix = targets["adj_matrix"]
+            num_negative_samples = int((adj_matrix != 0).sum().item() / 2)
             num_nodes = adj_matrix.size(0)
-            
-            # Iterate through upper triangle of adjacency matrix
-            for i in range(num_nodes):
+
+            for i in tqdm(range(num_nodes), desc="Positive Adjacency"):
                 for j in range(i + 1, num_nodes):
                     edge_weight = adj_matrix[i, j].item()
-                    
-                    if edge_weight > 0:  # Edge exists
-                        # Compute distance between connected nodes
+                    if edge_weight > 0:
+                        edge_set.add((i, j))
+                        edge_set.add((j, i))
                         distance = self.compute_pairwise_distance(z, i, j)
-                        total_distance += edge_weight * distance
-                        num_edges += edge_weight
-        
+                        total_pos_distance += edge_weight * (distance**2)
+                        num_pos_edges += edge_weight
+
+            # Sample negative edges
+            neg_samples = 0
+            with tqdm(total=num_negative_samples, desc="Negative Sampling") as pbar:
+                while neg_samples < num_negative_samples:
+                    i = torch.randint(0, num_nodes, (1,)).item()
+                    j = torch.randint(0, num_nodes, (1,)).item()
+                    if i == j or (i, j) in edge_set:
+                        continue
+                    distance = self.compute_pairwise_distance(z, i, j)
+                    penalty = 1.0 / (1.0 + distance)
+                    total_neg_penalty += penalty
+                    neg_samples += 1
+                    pbar.update(1)
+
         else:
             raise ValueError("Targets must contain either 'edge_index' or 'adj_matrix'")
         
-        # Normalize by number of edges and apply weight
-        if num_edges > 0:
-            avg_distance = total_distance / num_edges
-            loss = self.distance_weight * avg_distance
+        # Compute final loss
+        if num_pos_edges > 0:
+            avg_pos_distance = total_pos_distance / num_pos_edges
+            pos_loss = avg_pos_distance
         else:
-            # No edges found - return zero loss
-            loss = torch.tensor(0.0, device=z.device, requires_grad=True)
+            pos_loss = torch.tensor(0.0, device=z.device, requires_grad=True)
+
+        neg_loss = negative_distance_weight * (total_neg_penalty / num_negative_samples) #* ((2 * num_negative_samples) / (num_nodes*(num_nodes-1)))
+        print("Loss: pos=", pos_loss[0], " neg=", neg_loss[0], " (", (neg_loss[0]*100)/(pos_loss[0] + neg_loss[0]) , "%) total=", pos_loss[0] + neg_loss[0])
         
-        return loss
+        #return pos_loss * (neg_loss.detach() / (pos_loss.detach() + 1e-8)) + neg_loss
+        return pos_loss + neg_loss
     
     def compute_jacobian(self, z: torch.Tensor, node_idx: int = None) -> torch.Tensor:
         """
@@ -1902,3 +1935,487 @@ class LatentDistanceDecoder(DecoderBase):
             "metric_cache_size": len(self._metric_cache),
             "jacobian_cache_size": len(self._jacobian_cache)
         }
+    
+
+class ManifoldHeatKernelDecoder(DecoderBase):
+    """
+    Fictive decoder that outputs latent codes but computes a meaningful loss 
+    based on manifold heat kernel divergence with graph Laplacian.
+    Uses proper Riemannian distance computation via line integration.
+    """
+    def __init__(
+        self, 
+        latent_dim: int,
+        reference_decoder_name: str = "node_attr_decoder",
+        heat_time: Union[float, List[float]] = 1.0,  # Time parameter for heat kernel
+        num_eigenvalues: int = 50,  # Number of eigenvalues to compute
+        num_integration_points: int = 10,  # For Riemannian distance integration
+        metric_regularization: float = 1e-6,
+        cache_jacobians: bool = True,
+        # Simple caching parameters
+        cache_tolerance: float = 1e-4,
+        max_cache_size: int = 1000,
+        # Heat kernel specific parameters
+        laplacian_regularization: float = 1e-8,
+        heat_kernel_approximation: str = "spectral",  # "spectral" or "finite_difference"
+        finite_diff_steps: int = 100,
+        # Manifold Laplacian construction
+        manifold_neighbors: int = 10,  # How many nearest neighbors to connect in manifold
+        gaussian_bandwidth: float = 1.0,  # Bandwidth for Gaussian weights
+        name: str = "manifold_heat_kernel_decoder"
+    ):
+        super(ManifoldHeatKernelDecoder, self).__init__(latent_dim, name)
+        
+        self.reference_decoder_name = reference_decoder_name
+        self.heat_times = [heat_time] if isinstance(heat_time, (float, int)) else list(heat_time)
+        self.num_eigenvalues = num_eigenvalues
+        self.num_integration_points = num_integration_points
+        self.metric_regularization = metric_regularization
+        self.cache_jacobians = cache_jacobians
+        self.cache_tolerance = cache_tolerance
+        self.max_cache_size = max_cache_size
+        self.laplacian_regularization = laplacian_regularization
+        self.heat_kernel_approximation = heat_kernel_approximation
+        self.finite_diff_steps = finite_diff_steps
+        self.manifold_neighbors = manifold_neighbors
+        self.gaussian_bandwidth = gaussian_bandwidth
+        
+        # Simple cache: store (z_point_hash, metric_tensor) pairs
+        self._metric_cache = {}
+        self._jacobian_cache = {}
+        self._riemannian_distance_cache = {}
+        self._heat_kernel_cache = {}
+        self._cache_valid = False
+        self._reference_decoder = None
+    
+    def set_reference_decoder(self, decoder: "DecoderBase"):
+        """Set the reference decoder used for Jacobian computation"""
+        self._reference_decoder = decoder
+        self._clear_all_caches()
+    
+    def _clear_all_caches(self):
+        """Clear all caches"""
+        self._jacobian_cache.clear()
+        self._metric_cache.clear()
+        self._riemannian_distance_cache.clear()
+        self._heat_kernel_cache.clear()
+        self._cache_valid = False
+    
+    def _get_cache_key(self, z_point: torch.Tensor, node_idx: int) -> str:
+        """Generate a simple cache key from z_point and node_idx"""
+        z_rounded = torch.round(z_point / self.cache_tolerance) * self.cache_tolerance
+        z_str = "_".join([f"{x:.6f}" for x in z_rounded.cpu().numpy()])
+        return f"{node_idx}_{z_str}"
+    
+    def _find_cached_metric(self, z_point: torch.Tensor, node_idx: int) -> Optional[torch.Tensor]:
+        """Find cached metric tensor for similar z_point"""
+        cache_key = self._get_cache_key(z_point, node_idx)
+        
+        if cache_key in self._metric_cache:
+            cached_z, cached_metric = self._metric_cache[cache_key]
+            if torch.norm(z_point - cached_z) < self.cache_tolerance:
+                return cached_metric.to(device=z_point.device, dtype=z_point.dtype)
+        
+        return None
+    
+    def _cache_metric(self, z_point: torch.Tensor, node_idx: int, metric_tensor: torch.Tensor):
+        """Cache a metric tensor"""
+        if len(self._metric_cache) >= self.max_cache_size:
+            oldest_key = next(iter(self._metric_cache))
+            del self._metric_cache[oldest_key]
+        
+        cache_key = self._get_cache_key(z_point, node_idx)
+        self._metric_cache[cache_key] = (z_point.detach().clone(), metric_tensor.detach().clone())
+    
+    def forward(self, z: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+        """Forward pass - simply returns the latent codes (fictive decoder)"""
+        return {"latent_codes": z.clone()}
+    
+    def compute_metric_tensor(self, z: torch.Tensor, node_idx: int) -> torch.Tensor:
+        """
+        Compute the Riemannian metric tensor at a given point in latent space
+        """
+        z_point = z[node_idx]
+        
+        # Try to find cached result first
+        cached_metric = self._find_cached_metric(z_point, node_idx)
+        if cached_metric is not None:
+            # Preserve gradients by adding zero times actual computation
+            actual_metric = self._compute_metric_raw(z, node_idx)
+            return cached_metric + 0.0 * actual_metric
+        
+        # Compute fresh metric tensor
+        metric_tensor = self._compute_metric_raw(z, node_idx)
+        
+        # Cache the result (detached)
+        if self.cache_jacobians:
+            self._cache_metric(z_point, node_idx, metric_tensor)
+        
+        return metric_tensor
+    
+    def _compute_metric_raw(self, z: torch.Tensor, node_idx: int) -> torch.Tensor:
+        """Raw computation of metric tensor without caching"""
+        if self._reference_decoder is None:
+            return torch.eye(self.latent_dim, device=z.device, dtype=z.dtype)
+        
+        try:
+            # Compute Jacobian of reference decoder at this point        
+            jacobian = self._reference_decoder.compute_jacobian(z, node_idx)
+            
+            # Handle different Jacobian shapes
+            if jacobian.dim() == 2:
+                if jacobian.size(1) != self.latent_dim:
+                    raise ValueError(f"Jacobian latent dimension {jacobian.size(1)} doesn't match expected {self.latent_dim}")
+                metric_tensor = torch.mm(jacobian.t(), jacobian)
+            elif jacobian.dim() == 3:
+                if node_idx >= jacobian.size(0):
+                    raise ValueError(f"Node index {node_idx} out of bounds for Jacobian with {jacobian.size(0)} nodes")
+                node_jacobian = jacobian[node_idx]
+                if node_jacobian.size(1) != self.latent_dim:
+                    raise ValueError(f"Jacobian latent dimension {node_jacobian.size(1)} doesn't match expected {self.latent_dim}")
+                metric_tensor = torch.mm(node_jacobian.t(), node_jacobian)
+            elif jacobian.dim() == 1:
+                if jacobian.size(0) == self.latent_dim:
+                    metric_tensor = torch.outer(jacobian, jacobian)
+                else:
+                    raise ValueError(f"1D Jacobian size {jacobian.size(0)} doesn't match latent_dim {self.latent_dim}")
+            else:
+                raise ValueError(f"Unexpected Jacobian shape: {jacobian.shape}")
+            
+            # Add regularization for numerical stability
+            metric_tensor += self.metric_regularization * torch.eye(
+                self.latent_dim, device=z.device, dtype=z.dtype
+            )
+            
+            return metric_tensor
+            
+        except Exception as e:
+            print(f"Warning: Failed to compute Jacobian metric, falling back to identity: {e}")
+            return torch.eye(self.latent_dim, device=z.device, dtype=z.dtype)
+    
+    def compute_riemannian_distance(
+        self, 
+        u: torch.Tensor, 
+        v: torch.Tensor, 
+        z_full: torch.Tensor,
+        node_idx_u: int,
+        node_idx_v: int
+    ) -> torch.Tensor:
+        """
+        Compute proper Riemannian distance using line integration:
+        d(u,v) = ∫₀¹ √((u-v)ᵀG(x(t))(u-v))dt where x(t) = tu + (1-t)v
+        """
+        # Check cache first
+        #cache_key = f"dist_{node_idx_u}_{node_idx_v}_{hash((u.data.tobytes(), v.data.tobytes()))}"
+        u_str = "_".join([f"{x:.6f}" for x in u.detach().cpu().numpy()])
+        v_str = "_".join([f"{x:.6f}" for x in v.detach().cpu().numpy()])
+        cache_key = f"dist_{node_idx_u}_{node_idx_v}_{u_str}_{v_str}"
+        if cache_key in self._riemannian_distance_cache:
+            cached_dist = self._riemannian_distance_cache[cache_key]
+            # Preserve gradients
+            actual_dist = self._compute_riemannian_distance_raw(u, v, z_full, node_idx_u, node_idx_v)
+            return cached_dist + 0.0 * actual_dist
+        
+        distance = self._compute_riemannian_distance_raw(u, v, z_full, node_idx_u, node_idx_v)
+        
+        # Cache result
+        if self.cache_jacobians and len(self._riemannian_distance_cache) < self.max_cache_size:
+            self._riemannian_distance_cache[cache_key] = distance.detach().clone()
+        
+        return distance
+    
+    def _compute_riemannian_distance_raw(
+        self, 
+        u: torch.Tensor, 
+        v: torch.Tensor, 
+        z_full: torch.Tensor,
+        node_idx_u: int,
+        node_idx_v: int
+    ) -> torch.Tensor:
+        """Raw computation of Riemannian distance"""
+        def integrand(t):
+            # Interpolated point
+            x_t = t * u + (1 - t) * v
+            
+            # Create temporary z matrix with interpolated point
+            # Use midpoint node index for metric computation
+            mid_idx = (node_idx_u + node_idx_v) // 2
+            z_temp = z_full.clone()
+            z_temp[mid_idx] = x_t
+            
+            try:
+                # Compute metric tensor at interpolated point
+                G = self.compute_metric_tensor(z_temp, mid_idx)
+                
+                # Compute distance element: sqrt((u-v)^T @ G @ (u-v))
+                diff = u - v
+                quadratic_form = torch.sum(diff * (G @ diff))
+                return torch.sqrt(torch.clamp(quadratic_form, min=1e-8))
+                
+            except Exception as e:
+                # Fallback to Euclidean distance
+                return torch.norm(u - v)
+        
+        # Numerical integration using trapezoidal rule
+        t_vals = torch.linspace(0, 1, self.num_integration_points, device=u.device)
+        dt = 1.0 / (self.num_integration_points - 1)
+        
+        integrand_vals = torch.stack([integrand(t) for t in t_vals])
+        integral = torch.trapz(integrand_vals, dx=dt)
+        
+        return integral
+    
+    def compute_manifold_laplacian(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the Laplace-Beltrami operator on the manifold using proper Riemannian distances
+        FIXED VERSION: Fully differentiable using Gaussian RBF weights
+        """
+        num_nodes = z.size(0)
+        device = z.device
+        
+        # Compute all pairwise Riemannian distances
+        print("Computing pairwise Riemannian distances...")
+        distances = torch.zeros(num_nodes, num_nodes, device=device, dtype=z.dtype)
+        
+        for i in tqdm(range(num_nodes), desc="Computing distances"):
+            for j in range(i + 1, num_nodes):
+                dist = self.compute_riemannian_distance(z[i], z[j], z, i, j)
+                distances[i, j] = dist
+                distances[j, i] = dist  # Symmetric
+        
+        # FIXED: Use differentiable Gaussian RBF weights instead of k-NN
+        # This creates a fully connected graph with exponentially decaying weights
+        weights = torch.exp(-distances**2 / (2 * self.gaussian_bandwidth**2))
+        
+        # Zero out diagonal (no self-connections)
+        weights = weights * (1 - torch.eye(num_nodes, device=device))
+        
+        # Optional: Threshold very small weights to maintain some sparsity
+        threshold = 1e-4
+        weights = torch.where(weights > threshold, weights, torch.zeros_like(weights))
+        
+        # Create Laplacian: L = D - W where D is degree matrix
+        degree = torch.sum(weights, dim=1)
+        L_manifold = torch.diag(degree) - weights
+        
+        # Add regularization
+        L_manifold += self.laplacian_regularization * torch.eye(num_nodes, device=device)
+        
+        return L_manifold
+    
+    def compute_heat_kernel_spectral(self, laplacian: torch.Tensor, t: Union[float, List[float]]) -> torch.Tensor:
+        """
+        Compute heat kernel using spectral decomposition: K(t) = exp(-t*L)
+        """
+        try:
+            # Eigendecomposition of Laplacian
+            eigenvals, eigenvecs = torch.linalg.eigh(laplacian)
+            
+            # Clamp eigenvalues to avoid numerical issues
+            eigenvals = torch.clamp(eigenvals, min=0.0)
+            
+            # Take only the first num_eigenvalues for efficiency
+            if self.num_eigenvalues < eigenvals.size(0):
+                eigenvals = eigenvals[:self.num_eigenvalues]
+                eigenvecs = eigenvecs[:, :self.num_eigenvalues]
+            
+            # Compute heat kernel: K(t) = V * exp(-t*Λ) * V^T
+            if isinstance(t, (float, int)):
+                exp_eigenvals = torch.exp(-t * eigenvals)
+                return eigenvecs @ torch.diag(exp_eigenvals) @ eigenvecs.t()
+            else:
+                heat_kernels = []
+                for t_i in t:
+                    exp_eigenvals = torch.exp(-t_i * eigenvals)
+                    K_t = eigenvecs @ torch.diag(exp_eigenvals) @ eigenvecs.t()
+                    heat_kernels.append(K_t)
+                return heat_kernels
+                        
+        except Exception as e:
+            print(f"Warning: Spectral heat kernel computation failed: {e}")
+            # Fallback to identity
+            return torch.eye(laplacian.size(0), device=laplacian.device, dtype=laplacian.dtype)
+    
+    def compute_heat_kernel_finite_diff(self, laplacian: torch.Tensor, t: Union[float, List[float]]) -> torch.Tensor:
+        """
+        Compute heat kernel using finite difference approximation of exp(-t*L)
+        """
+        def compute_single_kernel(t_i):
+            dt = t_i / self.finite_diff_steps
+            K = torch.eye(laplacian.size(0), device=laplacian.device, dtype=laplacian.dtype)
+            for _ in range(self.finite_diff_steps):
+                K = K - dt * (laplacian @ K)
+            return K
+
+        if isinstance(t, (float, int)):
+            return compute_single_kernel(t)
+        return [compute_single_kernel(t_i) for t_i in t]
+    
+    def compute_graph_laplacian(self, targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Compute the graph Laplacian from edge information
+        """
+        if "edge_index" in targets:
+            edge_index = targets["edge_index"]
+            num_nodes = targets.get("num_nodes", torch.max(edge_index) + 1)
+            edge_weights = targets.get("edge_labels", torch.ones(edge_index.size(1)))
+            
+            # Create adjacency matrix
+            adj = torch.zeros(num_nodes, num_nodes, device=edge_index.device, dtype=torch.float32)
+            for i in range(edge_index.size(1)):
+                src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+                weight = edge_weights[i].item() if edge_weights is not None else 1.0
+                adj[src, dst] = weight
+                adj[dst, src] = weight  # Symmetric
+            
+        elif "adj_matrix" in targets:
+            adj = targets["adj_matrix"].float()
+            num_nodes = adj.size(0)
+        else:
+            raise ValueError("Targets must contain either 'edge_index' or 'adj_matrix'")
+        
+        # Compute degree matrix
+        degree = torch.sum(adj, dim=1)
+        D = torch.diag(degree)
+        
+        # Laplacian: L = D - A
+        laplacian = D - adj
+        
+        # Add small regularization
+        laplacian += self.laplacian_regularization * torch.eye(num_nodes, device=adj.device)
+        
+        return laplacian
+    
+    def compute_heat_kernel_divergence(
+        self,
+        K_manifold: Union[torch.Tensor, List[torch.Tensor]],
+        K_graph:    Union[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
+        """
+        Compute divergence between manifold heat kernel and graph heat kernel
+        Using Frobenius norm of the difference
+        """
+        # If we got lists of kernels, compute per‐t and average:
+        if isinstance(K_manifold, (list, tuple)):
+            divergences = [
+                self.compute_heat_kernel_divergence(Km, Kg)
+                for Km, Kg in zip(K_manifold, K_graph)
+            ]
+            # average (you can also sum or weight here)
+            return torch.stack(divergences).sum()
+
+        # Normalize both kernels to have same trace for fair comparison
+        trace_manifold = torch.trace(K_manifold)
+        trace_graph    = torch.trace(K_graph)
+        
+        if trace_manifold > 1e-8:
+            K_manifold_norm = K_manifold * (trace_graph / trace_manifold)
+        else:
+            K_manifold_norm = K_manifold
+        
+        # Compute Frobenius norm of difference
+        diff = K_manifold_norm - K_graph
+        return torch.norm(diff, p='fro')
+    
+    def compute_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        heat_kernel_weight: float = 1e6,
+    ) -> torch.Tensor:
+        """
+        Compute loss based on heat kernel divergence between manifold and graph
+        """
+        z = outputs["latent_codes"]
+        num_nodes = z.size(0)
+        
+        # Clear cache if needed
+        if not self._cache_valid:
+            self._clear_all_caches()
+            self._cache_valid = True
+        
+        print("Computing graph Laplacian...")
+        # Compute graph Laplacian
+        L_graph = self.compute_graph_laplacian(targets)
+        
+        print("Computing manifold Laplacian...")
+        # Compute manifold Laplacian (this will compute Riemannian distances)
+        L_manifold = self.compute_manifold_laplacian(z)
+        
+        print("Computing heat kernels...")
+        # Compute heat kernels
+        if self.heat_kernel_approximation == "spectral":
+            K_graph = self.compute_heat_kernel_spectral(L_graph, self.heat_times)
+            K_manifold = self.compute_heat_kernel_spectral(L_manifold, self.heat_times)
+        else:  # finite_difference
+            K_graph = self.compute_heat_kernel_finite_diff(L_graph, self.heat_times)
+            K_manifold = self.compute_heat_kernel_finite_diff(L_manifold, self.heat_times)
+        
+        print("Computing heat kernel divergence...")
+        # Compute divergence
+        divergence = self.compute_heat_kernel_divergence(K_manifold, K_graph)
+        
+        # Total loss
+        total_loss = heat_kernel_weight * divergence
+        
+        print(f"Heat kernel divergence: {(divergence.item()):.6f}")
+        print(f"Total loss: {(total_loss.item()):.6f}")
+        
+        return total_loss
+    
+    def compute_jacobian(self, z: torch.Tensor, node_idx: int = None) -> torch.Tensor:
+        """
+        Compute Jacobian for this decoder (identity since we output z)
+        """
+        if node_idx is not None:
+            return torch.eye(self.latent_dim, device=z.device, dtype=z.dtype)
+        else:
+            batch_size = z.size(0)
+            return torch.eye(self.latent_dim, device=z.device, dtype=z.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+    
+    def invalidate_cache(self):
+        """Invalidate all caches"""
+        self._clear_all_caches()
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get caching statistics"""
+        return {
+            "metric_cache_size": len(self._metric_cache),
+            "jacobian_cache_size": len(self._jacobian_cache),
+            "riemannian_distance_cache_size": len(self._riemannian_distance_cache),
+            "heat_kernel_cache_size": len(self._heat_kernel_cache)
+        }
+    
+    def get_heat_kernels(self, z: torch.Tensor, targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Utility method to get both heat kernels for analysis
+        """
+        L_graph = self.compute_graph_laplacian(targets)
+        L_manifold = self.compute_manifold_laplacian(z)
+        
+        if self.heat_kernel_approximation == "spectral":
+            K_graph = self.compute_heat_kernel_spectral(L_graph, self.heat_times)
+            K_manifold = self.compute_heat_kernel_spectral(L_manifold, self.heat_times)
+        else:
+            K_graph = self.compute_heat_kernel_finite_diff(L_graph, self.heat_times)
+            K_manifold = self.compute_heat_kernel_finite_diff(L_manifold, self.heat_times)
+        
+        return {
+            "graph_laplacian": L_graph,
+            "manifold_laplacian": L_manifold,
+            "graph_heat_kernel": K_graph,
+            "manifold_heat_kernel": K_manifold,
+            "riemannian_distances": self._get_distance_matrix(z)
+        }
+    
+    def _get_distance_matrix(self, z: torch.Tensor) -> torch.Tensor:
+        """Get the full Riemannian distance matrix (for analysis)"""
+        num_nodes = z.size(0)
+        distances = torch.zeros(num_nodes, num_nodes, device=z.device, dtype=z.dtype)
+        
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                dist = self.compute_riemannian_distance(z[i], z[j], z, i, j)
+                distances[i, j] = dist
+                distances[j, i] = dist
+        
+        return distances

@@ -182,7 +182,6 @@ class DistanceApproxBenchmarker:
         # The z_range will default to the manifold's bounds if not specified by experiment
         # We explicitly set a z_range here to match the original function's behavior
         curvature, Z1, Z2 = self.manifold_instance.visualize_manifold_curvature(
-            z_range=np.array([[-2, 2], [-2, 2]]), # Example hardcoded range, can be made dynamic
             resolution=50,
             data_points=test_points,
             labels=labels
