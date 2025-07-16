@@ -1906,7 +1906,7 @@ class LatentDistanceDecoder(DecoderBase):
             pos_loss = torch.tensor(0.0, device=z.device, requires_grad=True)
 
         neg_loss = negative_distance_weight * (total_neg_penalty / num_negative_samples) #* ((2 * num_negative_samples) / (num_nodes*(num_nodes-1)))
-        print("Loss: pos=", pos_loss[0], " neg=", neg_loss[0], " (", (neg_loss[0]*100)/(pos_loss[0] + neg_loss[0]) , "%) total=", pos_loss[0] + neg_loss[0])
+        print("Loss: pos=", pos_loss, " neg=", neg_loss, " (", (neg_loss*100)/(pos_loss + neg_loss) , "%) total=", pos_loss + neg_loss)
         
         #return pos_loss * (neg_loss.detach() / (pos_loss.detach() + 1e-8)) + neg_loss
         return pos_loss + neg_loss
