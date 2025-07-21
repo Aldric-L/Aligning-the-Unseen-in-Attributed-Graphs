@@ -102,7 +102,9 @@ class MLPEncoder(nn.Module):
         latent_dim: int,
         mlp_layers: int = 3,
         dropout: float = 0.1,
-        activation=nn.ReLU()
+        activation=nn.ReLU(),
+        mu_activation=None,
+        variance_dimension = None
     ):
         """
         Args:
@@ -120,6 +122,8 @@ class MLPEncoder(nn.Module):
         self.mlp_layers = mlp_layers
         self.dropout = dropout
         self.activation = activation
+        self.mu_activation = mu_activation
+        self.variance_dimension = variance_dimension if variance_dimension is not None else latent_dim 
 
         # MLP layers
         self.mlp = nn.ModuleList()
@@ -127,12 +131,28 @@ class MLPEncoder(nn.Module):
         
         for i in range(mlp_layers):
             out_features = hidden_dims[i] if i < len(hidden_dims) else hidden_dims[-1]
-            self.mlp.append(nn.Linear(in_features, out_features))
+            layer = nn.Linear(in_features, out_features)
+            
+            # Apply Glorot (Xavier) initialization to the weights of this layer
+            # You can choose xavier_uniform_ or xavier_normal_
+            nn.init.xavier_uniform_(layer.weight)
+            # It's common to initialize biases to zero
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0)
+                
+            self.mlp.append(layer)
             in_features = out_features
         
         # Mean and log variance projections
         self.fc_mu = nn.Linear(in_features, latent_dim)
-        self.fc_logvar = nn.Linear(in_features, latent_dim)
+        self.fc_logvar = nn.Linear(in_features, self.variance_dimension)
+        nn.init.xavier_uniform_(self.fc_mu.weight)
+        if self.fc_mu.bias is not None:
+            nn.init.constant_(self.fc_mu.bias, 0)
+
+        nn.init.xavier_uniform_(self.fc_logvar.weight)
+        if self.fc_logvar.bias is not None:
+            nn.init.constant_(self.fc_logvar.bias, 0)
         
     def forward(self, x, edge_index=None):
         """
@@ -152,6 +172,8 @@ class MLPEncoder(nn.Module):
         
         # Latent projections
         mu = self.fc_mu(x)
+        if self.mu_activation is not None:
+            mu = self.mu_activation(mu)
         logvar = self.fc_logvar(x)
         
         return mu, logvar

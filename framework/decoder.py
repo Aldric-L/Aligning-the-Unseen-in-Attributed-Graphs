@@ -139,6 +139,79 @@ class DecoderBase(nn.Module, ABC):
         loss_components['total'] = total_loss
         return loss_components
 
+class MLPDecoder(DecoderBase):
+    def __init__(self, latent_dim, out_dim, hidden_dims, dropout=0.5,
+                 activation=nn.ReLU, name="mlp_decoder"):
+        super().__init__(latent_dim, name)
+        layers, d = [], latent_dim
+        for h in hidden_dims:
+            layers += [
+                nn.Linear(d, h),
+                activation(),
+                nn.Dropout(dropout)
+            ]
+            d = h
+        layers.append(nn.Linear(d, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z, **kwargs):
+        return {"recon": self.net(z)}
+
+    def compute_loss(self, outputs, targets):
+        return F.mse_loss(outputs["recon"], targets["x"])
+    
+    def compute_jacobian(self, z: torch.Tensor, node_idx: Optional[int] = None) -> torch.Tensor:
+        """
+        Compute the Jacobian of the decoder output with respect to the latent space.
+
+        Args:
+            z: Latent variables.
+               - If [num_nodes, latent_dim]: Computes the Jacobian for all nodes.
+               - If [latent_dim]: Computes the Jacobian for a single node.
+
+        Returns:
+            Jacobian matrix or tensor:
+            - If input z was [latent_dim]: [output_dim, latent_dim]
+            - Else (input z was [num_nodes, latent_dim]): [num_nodes, output_dim, latent_dim]
+        """
+        z_original_ndim = z.ndim
+        z = z.detach()  # Ensure no unwanted gradients
+
+        if z_original_ndim == 1: # Single node case: z is [latent_dim]
+            # Compute Jacobian for a single node
+            # The function 'f' should take a [latent_dim] tensor and return [output_dim]
+            def f(z_single_node: torch.Tensor) -> torch.Tensor:
+                # Assuming self.forward can handle a single [latent_dim] input
+                # or needs it unsqueezed to [1, latent_dim] then squeezed back to [output_dim]
+                # Adjust 'f' based on your actual decoder_model.forward's expected input for a single item.
+                return self.forward(z_single_node)["recon"]
+
+            z.requires_grad_(True)
+            J = jacobian(f, z, vectorize=True) # J will be [output_dim, latent_dim]
+            return J
+
+        elif z_original_ndim == 2: # Batch case: z is [num_nodes, latent_dim]
+            # Compute full Jacobian for all nodes (batch Jacobian)
+            def f(z_all: torch.Tensor) -> torch.Tensor:
+                # self.decoder_model.forward should take [num_nodes, latent_dim]
+                # and return [num_nodes, output_dim]
+                return self.forward(z_all)["recon"]
+
+            z.requires_grad_(True)
+            # This computes J with shape [num_nodes, output_dim, num_nodes, latent_dim]
+            J = jacobian(f, z, vectorize=True)
+
+            # Extract only the relevant Jacobians (diagonal blocks)
+            # This assumes that the output for node 'n' only depends on input 'z[n]'.
+            # If there are cross-node dependencies, this extraction is not sufficient.
+            num_nodes, output_dim, _, latent_dim = J.shape
+            return torch.stack([J[n, :, n, :] for n in range(num_nodes)], dim=0) # [num_nodes, output_dim, latent_dim]
+
+        else:
+            raise ValueError(
+                f"Unsupported input z dimensions for Jacobian computation: {z_original_ndim}. "
+                f"Expected 1 (for single node) or 2 (for batch of nodes)."
+            )
 
 class NodeAttributeDecoder(DecoderBase):
     """
