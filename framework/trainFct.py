@@ -219,7 +219,7 @@ def train_model(
             # Forward pass
             model.train()
             optimizer.zero_grad()
-            outputs = model(x, edge_index)
+            outputs = model(x, edge_index=edge_index)
             
             # Prepare targets
             targets = {
@@ -409,7 +409,7 @@ def train_phase1(
             # Forward pass with fully connected edge index
             model.train()
             optimizer.zero_grad()
-            outputs = model(x, edge_index)
+            outputs = model(x, edge_index=edge_index)
             
             # Prepare targets (only node features)
             targets = {
@@ -544,7 +544,7 @@ def train_phase2(
             # Forward pass
             model.train()
             optimizer.zero_grad()
-            outputs = model(x, edge_index)
+            outputs = model(x, edge_index=edge_index)
             
             # Prepare targets
             targets = {

@@ -58,7 +58,7 @@ def visualize_latent_space(model, data_loader, device="cuda" if torch.cuda.is_av
             edge_index = batch.edge_index.to(device)
             
             # Get latent representations
-            mu, _ = model.encode(x, edge_index)
+            mu, _ = model.encode(x, edge_index=edge_index)
             z = mu.cpu().numpy()
             
             all_z.append(z)
@@ -190,7 +190,7 @@ def visualize_node_features_reconstruction(model, data, sample_features=20,
     
     # Forward pass
     with torch.no_grad():
-        outputs = model(x, edge_index)
+        outputs = model(x, edge_index=edge_index)
         
         # Get reconstructed node features
         node_decoder = model.get_decoder("node_attr_decoder")

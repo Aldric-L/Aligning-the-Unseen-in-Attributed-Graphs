@@ -248,7 +248,7 @@ class BoundedManifold:
                 pbar.update(1)
 
         self._is_filled = True # Set the flag to True after successful computation
-        print("Full grid metric tensor computation complete.")
+        #print("Full grid metric tensor computation complete.")
 
     def get_dimension(self) -> int:
         return self._n_dimensions
@@ -504,7 +504,8 @@ class BoundedManifold:
                         else:
                             curv_val = self.compute_gaussian_curvature(self.metric_tensor(clamped_z))
                             curvature[i, j] = curv_val
-                    except (ValueError, RuntimeError):
+                    except (ValueError, RuntimeError) as e:
+                        print(f"Error computing curvature at point {z}: {e}. Setting to NaN.")
                         curvature[i, j] = torch.nan
             
             # Convert to numpy for plotting
@@ -516,7 +517,12 @@ class BoundedManifold:
             vmin, vmax = np.nanmin(curvature_np), np.nanmax(curvature_np)
             if np.isnan(vmin) or np.isnan(vmax) or vmin == vmax: vmin, vmax = -1, 1
             norm = colors.Normalize(vmin=vmin, vmax=vmax)
-            cmap = 'RdBu_r'
+            if vmin <= 0 and vmax >= 0:
+                cmap = 'RdBu_r'
+            elif vmin < 0 and vmax <= 0:
+                cmap = 'Blues_r'
+            else:
+                cmap = 'Reds'
 
             ax1 = fig.add_subplot(131)
             im = ax1.pcolormesh(Z1_np, Z2_np, curvature_np, cmap=cmap, norm=norm, shading='auto')

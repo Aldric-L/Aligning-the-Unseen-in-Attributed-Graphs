@@ -780,7 +780,7 @@ class NodeAttributeDecoder(DecoderBase):
         """
         z = z.detach()  # Ensure no unwanted gradients
 
-        if node_idx is not None:
+        if node_idx is not None or z.ndim == 1:
             # Compute Jacobian for a single node
             def f(z_node: torch.Tensor) -> torch.Tensor:
                 z_full = z.clone()
@@ -790,7 +790,7 @@ class NodeAttributeDecoder(DecoderBase):
             # Single-node input vector
             z_node = z[node_idx].detach().requires_grad_(True)
             J = jacobian(f, z_node, vectorize=True)  # [output_dim, latent_dim]
-            return J
+            return J if J.ndim == 2 else J.squeeze()  
 
         else:
             # Compute full Jacobian for all nodes
