@@ -531,7 +531,8 @@ def train_phase2(
         num_batches = 0
         
         # Process batches
-        iterator = tqdm(data_loader) if verbose else data_loader
+        #iterator = tqdm(data_loader) if verbose else data_loader
+        iterator = data_loader
         for batch in iterator:
             num_batches += 1
             

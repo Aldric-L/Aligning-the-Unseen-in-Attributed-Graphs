@@ -12,7 +12,7 @@ class DistanceApproximations:
     """
 
     @staticmethod
-    def linear_interpolation_distance(manifold: BoundedManifold, u: torch.Tensor, v: torch.Tensor, num_points: int = 100) -> torch.Tensor:
+    def linear_interpolation_distance(manifold: BoundedManifold, u: torch.Tensor, v: torch.Tensor, num_points: int = 20) -> torch.Tensor:
         """
         Compute distance by integrating along the straight line path in the ambient space.
         Formula: ∫₀¹ √((v-u)ᵀg(x(t))(v-u))dt where x(t) = (1-t)u + t*v.
@@ -50,6 +50,40 @@ class DistanceApproximations:
         # Use trapezoidal rule for numerical integration
         integral = torch.trapz(torch.stack(integrand_values), x=t_vals)
         return integral
+    
+    # @staticmethod
+    # def linear_interpolation_distance(
+    #     manifold: "BoundedManifold",
+    #     u: torch.Tensor,
+    #     v: torch.Tensor,
+    #     num_points: int = 50,
+    # ) -> torch.Tensor:
+    #     """
+    #     Per-pair linear interpolation distance fully in float precision.
+    #     """
+    #     # ensure float precision
+    #     u = u.float()
+    #     v = v.float()
+
+    #     # time samples in float32
+    #     t_vals = torch.linspace(0.0, 1.0, num_points, device=manifold.device)
+    #     t = t_vals.unsqueeze(-1)  # (T, 1)
+
+    #     diff = (v - u)
+    #     # build path points: (T, D)
+    #     X = (1 - t) * u.unsqueeze(0) + t * v.unsqueeze(0)
+    #     Xc = manifold._clamp_point_to_bounds(X)
+
+    #     # collect metric tensors with Python loop in float32
+    #     G = torch.stack([manifold.metric_tensor(x) for x in Xc], dim=0)  # (T, D, D)
+
+    #     # compute squared speed: einsum over t-index
+    #     diff_rep = diff.unsqueeze(0).expand_as(X)
+    #     seg_sq = torch.einsum("ti,tij,tj->t", diff_rep, G, diff_rep)
+    #     integrand = torch.sqrt(torch.relu(seg_sq) + 1e-12)
+
+    #     # trapezoidal rule
+    #     return torch.trapz(integrand, x=t_vals)
 
     @staticmethod
     def midpoint_approximation(manifold: BoundedManifold, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

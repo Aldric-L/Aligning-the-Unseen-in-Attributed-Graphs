@@ -216,7 +216,7 @@ class BoundedManifold:
         else:
             return self._metric_tensor_func(point)
 
-    def compute_full_grid_metric_tensor(self, force=False):
+    def compute_full_grid_metric_tensor(self, force=False, grads=True):
         """
         Computes and caches the metric tensor for all points on the defined grid.
         Args:
@@ -242,13 +242,74 @@ class BoundedManifold:
                 ]
                 point_coords = torch.stack(point_coords_list)
                 
-                with torch.no_grad(): # Disable gradient computation for filling the cache
+                if grads:
                     tensor = self._metric_tensor_func(point_coords)
+                else:
+                    with torch.no_grad(): # Disable gradient computation for filling the cache
+                        tensor = self._metric_tensor_func(point_coords)
                 self._grid_cache[tuple(indices_tuple)] = tensor
                 pbar.update(1)
 
         self._is_filled = True # Set the flag to True after successful computation
         #print("Full grid metric tensor computation complete.")
+
+    # def compute_full_grid_metric_tensor(self, force=False, batch_size=8):
+    #     """
+    #     Computes and caches the metric tensor for all points on the defined grid.
+    #     Args:
+    #         force (bool): If True, recomputes the metric tensor even if it has already been computed.
+    #         batch_size (int): Number of grid points to process simultaneously.
+    #     """
+    #     if not self.cache_enabled:
+    #         print("Caching is not enabled for this manifold instance. Full grid computation skipped.")
+    #         return
+    #     if self._is_filled and not force:
+    #         print("Full grid metric tensor has already been computed. Use 'force=True' to recompute.")
+    #         return
+
+    #     total_grid_points = np.prod(self._grid_points_per_dim)
+    #     self._grid_cache = {}  # Clear cache before recomputation if force is True
+        
+    #     # Pre-create coordinate tensors for each dimension
+    #     grid_coords = [torch.tensor(axis, dtype=torch.float32) for axis in self._grid_axes]
+        
+    #     with tqdm(total=total_grid_points, desc="Computing metric tensors") as pbar:
+    #         batch_indices = []
+    #         batch_coords = []
+            
+    #         for indices_tuple in product(*[range(n_points) for n_points in self._grid_points_per_dim]):
+    #             # Build coordinate vector efficiently
+    #             point_coords = torch.stack([grid_coords[d][indices_tuple[d]] for d in range(self._n_dimensions)])
+                
+    #             batch_indices.append(indices_tuple)
+    #             batch_coords.append(point_coords)
+                
+    #             if len(batch_coords) == batch_size:
+    #                 # Process batch
+    #                 batch_tensor = torch.stack(batch_coords)
+    #                 with torch.no_grad():
+    #                     batch_metrics = self._metric_tensor_func(batch_tensor)
+                    
+    #                 # Store and clear
+    #                 for idx, metric in zip(batch_indices, batch_metrics):
+    #                     self._grid_cache[tuple(idx)] = metric
+                    
+    #                 pbar.update(len(batch_coords))
+    #                 batch_indices.clear()
+    #                 batch_coords.clear()
+            
+    #         # Process remaining points
+    #         if batch_coords:
+    #             batch_tensor = torch.stack(batch_coords)
+    #             with torch.no_grad():
+    #                 batch_metrics = self._metric_tensor_func(batch_tensor)
+                
+    #             for idx, metric in zip(batch_indices, batch_metrics):
+    #                 self._grid_cache[tuple(idx)] = metric
+                
+    #             pbar.update(len(batch_coords))
+        
+    #     self._is_filled = True
 
     def get_dimension(self) -> int:
         return self._n_dimensions
@@ -452,12 +513,69 @@ class BoundedManifold:
             for i in range(n_points):
                 for j in range(i + 1, n_points):
                     u_point, v_point = data_points[i], data_points[j]
-                    dist = actual_distance_calculator(u_point, v_point, **kwargs)
+                    if "manifold" in actual_distance_calculator.__code__.co_varnames:
+                        dist = actual_distance_calculator(self, u_point, v_point, **kwargs)
+                    else:
+                        dist = actual_distance_calculator(u_point, v_point, **kwargs)
                     dist_matrix[i, j] = dist
                     dist_matrix[j, i] = dist
                     pbar.update(1)
         print("Distance matrix calculation complete.")
         return dist_matrix
+    
+    # def create_riemannian_distance_matrix(self, data_points: torch.Tensor,
+    #                                     distance_calculator: Callable = None,
+    #                                     **kwargs) -> torch.Tensor:
+    #     """
+    #     Creates a pairwise Riemannian distance matrix for the given data points.
+    #     """
+    #     n_points = data_points.shape[0]
+    #     dist_matrix = torch.zeros((n_points, n_points), device=self.device)
+    #     total_calculations = n_points * (n_points - 1) // 2
+    #     actual_distance_calculator = distance_calculator if distance_calculator is not None else self.exact_geodesic_distance
+
+    #     if n_points > 0 and data_points.shape[1] != self._n_dimensions:
+    #         raise ValueError(f"Dimension of data_points ({data_points.shape[1]}) does not match manifold dimension ({self._n_dimensions}).")
+
+    #     print(f"Calculating {total_calculations} pairwise Riemannian distances using {actual_distance_calculator.__name__}...")
+        
+    #     with tqdm(total=total_calculations, desc="Calculating distances") as pbar:
+    #         # Get upper triangular indices
+    #         ui, uj = torch.triu_indices(n_points, n_points, offset=1, device=self.device)
+            
+    #         # Extract point pairs
+    #         u_points = data_points[ui]
+    #         v_points = data_points[uj]
+            
+    #         # Create batched distance function
+    #         if "manifold" in actual_distance_calculator.__code__.co_varnames:
+    #             # For methods that need self (manifold) parameter
+    #             batched_dist = torch.vmap(
+    #                 lambda u, v: actual_distance_calculator(self, u, v, **kwargs),
+    #                 in_dims=(0, 0),
+    #                 out_dims=0
+    #             )
+    #         else:
+    #             # For methods that don't need self parameter
+    #             batched_dist = torch.vmap(
+    #                 lambda u, v: actual_distance_calculator(u, v, **kwargs),
+    #                 in_dims=(0, 0), 
+    #                 out_dims=0
+    #             )
+            
+    #         # Compute all distances at once
+    #         distances = batched_dist(u_points, v_points)
+            
+    #         # Fill upper triangular part
+    #         dist_matrix[ui, uj] = distances
+    #         # Fill lower triangular part (symmetric)
+    #         dist_matrix[uj, ui] = distances
+            
+    #         # Update progress bar once for all calculations
+    #         pbar.update(total_calculations)
+        
+    #     print("Distance matrix calculation complete.")
+    #     return dist_matrix
 
     @staticmethod
     def compute_gaussian_curvature(G: torch.Tensor) -> torch.Tensor:
@@ -486,7 +604,6 @@ class BoundedManifold:
                 bounds_np = self._bounds.cpu().numpy()
                 plot_z1 = np.linspace(bounds_np[0, 0], bounds_np[0, 1], resolution)
                 plot_z2 = np.linspace(bounds_np[1, 0], bounds_np[1, 1], resolution)
-            # ... (rest of z_range handling)
 
             Z1_np, Z2_np = np.meshgrid(plot_z1, plot_z2)
             Z1, Z2 = torch.from_numpy(Z1_np).to(self.device), torch.from_numpy(Z2_np).to(self.device)

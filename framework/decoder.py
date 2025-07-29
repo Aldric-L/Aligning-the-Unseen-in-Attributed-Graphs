@@ -320,10 +320,10 @@ class NodeAttributeDecoder(DecoderBase):
             Jacobian matrix
         """
         # Detach z and require gradients
-        z_detached = z.detach().clone().requires_grad_(True)
+        #z_detached = z.detach().clone().requires_grad_(True)
         
         # Forward pass to get node feature predictions
-        outputs = self.forward(z_detached)
+        outputs = self.forward(z)
         node_features = outputs["node_features"]
         
         # Handle single node case
@@ -336,18 +336,18 @@ class NodeAttributeDecoder(DecoderBase):
             # Compute Jacobian row by row
             for i in range(self.output_dim):
                 # Zero gradients
-                if z_detached.grad is not None:
-                    z_detached.grad.zero_()
+                if z.grad is not None:
+                    z.grad.zero_()
                 
                 # Backward for this feature dimension
                 node_features[i].backward(retain_graph=True)
                 
                 # Store gradient (Jacobian row)
-                jacobian[i] = z_detached.grad[node_idx].clone()
+                jacobian[i] = z.grad[node_idx].clone()
         
         else:
             # Full Jacobian for all nodes
-            batch_size = z_detached.size(0)
+            batch_size = z.size(0)
             
             # Initialize Jacobian tensor (nodes × output_dim × latent_dim)
             jacobian = torch.zeros(batch_size, self.output_dim, z.size(1), device=z.device)
@@ -356,14 +356,14 @@ class NodeAttributeDecoder(DecoderBase):
             for n in range(batch_size):
                 for i in range(self.output_dim):
                     # Zero gradients
-                    if z_detached.grad is not None:
-                        z_detached.grad.zero_()
+                    if z.grad is not None:
+                        z.grad.zero_()
                     
                     # Backward for this specific element
                     node_features[n, i].backward(retain_graph=True)
                     
                     # Store gradient
-                    jacobian[n, i] = z_detached.grad[n].clone()
+                    jacobian[n, i] = z.grad[n].clone()
         
         return jacobian
     
@@ -788,7 +788,8 @@ class NodeAttributeDecoder(DecoderBase):
                 return self.forward(z_full)["node_features"][node_idx]
 
             # Single-node input vector
-            z_node = z[node_idx].detach().requires_grad_(True)
+            #z_node = z[node_idx].detach().requires_grad_(True)
+            z_node = z[node_idx]
             J = jacobian(f, z_node, vectorize=True)  # [output_dim, latent_dim]
             return J if J.ndim == 2 else J.squeeze()  
 
@@ -797,7 +798,7 @@ class NodeAttributeDecoder(DecoderBase):
             def f(z_all: torch.Tensor) -> torch.Tensor:
                 return self.forward(z_all)["node_features"]  # [num_nodes, output_dim]
 
-            z.requires_grad_(True)
+            #z.requires_grad_(True)
             J = jacobian(f, z, vectorize=True)  # [num_nodes, output_dim, num_nodes, latent_dim]
 
             # Extract only the relevant Jacobians (diagonal blocks)
