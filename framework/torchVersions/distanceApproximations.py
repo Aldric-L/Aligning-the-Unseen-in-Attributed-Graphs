@@ -51,39 +51,69 @@ class DistanceApproximations:
         integral = torch.trapz(torch.stack(integrand_values), x=t_vals)
         return integral
     
-    # @staticmethod
-    # def linear_interpolation_distance(
-    #     manifold: "BoundedManifold",
-    #     u: torch.Tensor,
-    #     v: torch.Tensor,
-    #     num_points: int = 50,
-    # ) -> torch.Tensor:
-    #     """
-    #     Per-pair linear interpolation distance fully in float precision.
-    #     """
-    #     # ensure float precision
-    #     u = u.float()
-    #     v = v.float()
+    @staticmethod
+    def linear_interpolation_distance(manifold: BoundedManifold,
+            u: torch.Tensor,
+            v: torch.Tensor,
+            num_points: int = 50,
+        ) -> torch.Tensor:
+        """
+        Per-pair linear interpolation distance fully in float precision,
+        now batched over inputs of shape (D,) or (B, D).
+        Returns a scalar if inputs are (D,), or a tensor of shape (B,) if inputs are (B, D).
+        """
+        # ensure float
+        u = u.float()
+        v = v.float()
 
-    #     # time samples in float32
-    #     t_vals = torch.linspace(0.0, 1.0, num_points, device=manifold.device)
-    #     t = t_vals.unsqueeze(-1)  # (T, 1)
+        # make sure we have a batch dimension
+        single = (u.dim() == 1)
+        if single:
+            # from (D,) to (1, D)
+            u = u.unsqueeze(0)
+            v = v.unsqueeze(0)
 
-    #     diff = (v - u)
-    #     # build path points: (T, D)
-    #     X = (1 - t) * u.unsqueeze(0) + t * v.unsqueeze(0)
-    #     Xc = manifold._clamp_point_to_bounds(X)
+        # now u, v are (B, D)
+        B, D = u.shape
 
-    #     # collect metric tensors with Python loop in float32
-    #     G = torch.stack([manifold.metric_tensor(x) for x in Xc], dim=0)  # (T, D, D)
+        # time samples
+        t_vals = torch.linspace(0.0, 1.0, num_points, device=manifold.device, dtype=torch.float)
+        T = num_points
+        # shape (T, 1, 1) for broadcasting over (B, D)
+        t = t_vals.view(T, 1, 1)
 
-    #     # compute squared speed: einsum over t-index
-    #     diff_rep = diff.unsqueeze(0).expand_as(X)
-    #     seg_sq = torch.einsum("ti,tij,tj->t", diff_rep, G, diff_rep)
-    #     integrand = torch.sqrt(torch.relu(seg_sq) + 1e-12)
+        # build all interpolation points: shape (T, B, D)
+        # u.unsqueeze(0) is (1, B, D), same for v
+        X = (1.0 - t) * u.unsqueeze(0) + t * v.unsqueeze(0)
+        # clamp them, but _clamp_point_to_bounds wants (..., D)
+        X_flat = X.view(-1, D)  # (T*B, D)
+        Xc_flat = manifold._clamp_point_to_bounds(X_flat)
+        Xc = Xc_flat.view(T, B, D)
 
-    #     # trapezoidal rule
-    #     return torch.trapz(integrand, x=t_vals)
+        # compute metric tensor at each of the T*B points in one go:
+        # self.metric_tensor(Xc_flat, True) -> (T*B, D, D)
+        G_flat = manifold.metric_tensor(Xc_flat, True)
+        G = G_flat.view(T, B, D, D)  # (T, B, D, D)
+
+        # difference v - u: (B, D)
+        diff = (v - u)
+        # replicate over T: (T, B, D)
+        diff_rep = diff.unsqueeze(0).expand(T, B, D)
+
+        # squared speed at each (t, b)
+        # seg_sq[t,b] = diff_rep[t,b] @ G[t,b] @ diff_rep[t,b]
+        seg_sq = torch.einsum("tbi,tbij,tbj->tb", diff_rep, G, diff_rep)
+
+        # speed = sqrt(seg_sq)
+        integrand = torch.sqrt(torch.relu(seg_sq) + 1e-12)  # (T, B)
+
+        # trapezoidal integration over t: returns shape (B,)
+        dists = torch.trapz(integrand, x=t_vals, dim=0)  # (B,)
+
+        # if original inputs were single points, return scalar
+        if single:
+            return dists.squeeze(0)
+        return dists
 
     @staticmethod
     def midpoint_approximation(manifold: BoundedManifold, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

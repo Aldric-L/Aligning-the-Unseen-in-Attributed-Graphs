@@ -132,11 +132,7 @@ class MLPEncoder(nn.Module):
         for i in range(mlp_layers):
             out_features = hidden_dims[i] if i < len(hidden_dims) else hidden_dims[-1]
             layer = nn.Linear(in_features, out_features)
-            
-            # Apply Glorot (Xavier) initialization to the weights of this layer
-            # You can choose xavier_uniform_ or xavier_normal_
             nn.init.xavier_uniform_(layer.weight)
-            # It's common to initialize biases to zero
             if layer.bias is not None:
                 nn.init.constant_(layer.bias, 0)
                 

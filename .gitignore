@@ -178,3 +178,5 @@ cython_debug/
 
 data/
 old_utils/
+
+*.pth

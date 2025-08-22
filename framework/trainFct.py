@@ -395,7 +395,8 @@ def train_phase1(
         num_batches = 0
         
         # Process batches
-        iterator = tqdm(data_loader) if verbose else data_loader
+        #iterator = tqdm(data_loader) if verbose else data_loader
+        iterator = data_loader
         for batch in iterator:
             num_batches += 1
             
@@ -564,6 +565,11 @@ def train_phase2(
             
             # Backward pass
             loss_dict["total_loss"].backward()
+            # loss_dict["total_loss"].backward(retain_graph=True)
+
+            # for name, param in model.named_parameters():
+            #     if param.grad is not None:
+            #         print(name, "grad norm:", param.grad.norm().item())
             optimizer.step()
             
             # Step KL annealing scheduler
