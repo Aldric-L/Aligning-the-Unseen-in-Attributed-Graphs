@@ -302,17 +302,17 @@ def get_geodesic_distances(
 
 
 
-def immersion_paraboloid(u: np.ndarray, v: np.ndarray, D: int, a: float = 0.5) -> np.ndarray:
+def immersion_paraboloid(u: np.ndarray, v: np.ndarray, D: int, a: float = 0.5, seed: int | None = None) -> np.ndarray:
     """
     Paraboloid: f(u, v) = (u, v, (u^2 + v^2)/(2a)), a>0.
     Smooth, injective, rank 2 everywhere, image ≅ R^2 (no holes).
     """
     z = (u**2 + v**2) / (2.0 * a)
     base = np.stack([u, v, z], axis=1)
-    return _extend_dims(base, u, v, D)
+    return _extend_dims(base, u, v, D, seed)
 
 
-def immersion_helicoid(u: np.ndarray, v: np.ndarray, D: int, pitch: float = 0.5) -> np.ndarray:
+def immersion_helicoid(u: np.ndarray, v: np.ndarray, D: int, pitch: float = 0.5, seed: int | None = None) -> np.ndarray:
     """
     Helicoid: f(r, θ) = (r cos θ, r sin θ, pitch * θ), (r, θ) ∈ R^2.
     Rank 2 everywhere (including r=0); image ≅ R^2 (no holes).
@@ -321,10 +321,10 @@ def immersion_helicoid(u: np.ndarray, v: np.ndarray, D: int, pitch: float = 0.5)
     y = u * np.sin(v)
     z = pitch * v
     base = np.stack([x, y, z], axis=1)
-    return _extend_dims(base, u, v, D)
+    return _extend_dims(base, u, v, D, seed)
 
 
-def immersion_catenoid_like(u: np.ndarray, v: np.ndarray, D: int, a: float = 1.0) -> np.ndarray:
+def immersion_catenoid_like(u: np.ndarray, v: np.ndarray, D: int, a: float = 1.0, seed: int | None = None) -> np.ndarray:
     """
     "Unwrapped" catenoid-like sheet that’s diffeomorphic to R^2:
     Use (u, v) -> (cosh(u) cos v, cosh(u) sin v, a*u). Unlike the true catenoid
@@ -336,11 +336,11 @@ def immersion_catenoid_like(u: np.ndarray, v: np.ndarray, D: int, a: float = 1.0
     y = ch * np.sin(v)
     z = a * u
     base = np.stack([x, y, z], axis=1)
-    return _extend_dims(base, u, v, D)
+    return _extend_dims(base, u, v, D, seed)
 
 
 def immersion_soft_swiss(u: np.ndarray, v: np.ndarray, D: int,
-                         r0: float = 1.5, spread: float = 0.5, twist: float = 2.0) -> np.ndarray:
+                         r0: float = 1.5, spread: float = 0.5, twist: float = 2.0, seed: int | None = None) -> np.ndarray:
     """
     Soft, infinite 'swiss-roll-like' sheet with NO holes and NO hard boundary:
     r(u) = r0 + softplus(spread*u), θ(v) = twist * v,
@@ -354,7 +354,7 @@ def immersion_soft_swiss(u: np.ndarray, v: np.ndarray, D: int,
     y = r * np.sin(theta)
     z = theta
     base = np.stack([x, y, z], axis=1)
-    return _extend_dims(base, u, v, D)
+    return _extend_dims(base, u, v, D, seed)
 
 
 # Registry
@@ -539,7 +539,7 @@ def load_dataset(
     return X, Z_true, meta, Z_vae, immersion, true_metric
 
 
-def get_metric(manifold_name: ManifoldName) -> Callable[[float, float, int], np.ndarray]:
+def get_metric(manifold_name: ManifoldName, seed=None) -> Callable[[float, float, int], np.ndarray]:
     """
     Utility to get the true metric function for a given manifold name.
     """
@@ -548,9 +548,9 @@ def get_metric(manifold_name: ManifoldName) -> Callable[[float, float, int], np.
     immersion = IMMERSIONS[manifold_name]   
 
     def true_metric(u: float, v: float, D: int, eps: float = 1e-5) -> np.ndarray:
-        f0 = immersion(np.array([u]), np.array([v]), D)[0]
-        fu = (immersion(np.array([u + eps]), np.array([v]), D)[0] - f0) / eps
-        fv = (immersion(np.array([u]), np.array([v + eps]), D)[0] - f0) / eps
+        f0 = immersion(np.array([u]), np.array([v]), D, seed=seed)[0]
+        fu = (immersion(np.array([u + eps]), np.array([v]), D, seed=seed)[0] - f0) / eps
+        fv = (immersion(np.array([u]), np.array([v + eps]), D, seed=seed)[0] - f0) / eps
         J = np.stack([fu, fv], axis=1)
         return J.T @ J
     return true_metric
