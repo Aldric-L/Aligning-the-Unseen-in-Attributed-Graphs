@@ -126,7 +126,7 @@ class MLPEncoder(nn.Module):
         self.variance_dimension = variance_dimension if variance_dimension is not None else latent_dim 
 
         # MLP layers
-        self.mlp = nn.ModuleList()
+        self.encoder_mlp = nn.ModuleList()
         in_features = input_dim
         
         for i in range(mlp_layers):
@@ -136,19 +136,19 @@ class MLPEncoder(nn.Module):
             if layer.bias is not None:
                 nn.init.constant_(layer.bias, 0)
                 
-            self.mlp.append(layer)
+            self.encoder_mlp.append(layer)
             in_features = out_features
         
         # Mean and log variance projections
-        self.fc_mu = nn.Linear(in_features, latent_dim)
-        self.fc_logvar = nn.Linear(in_features, self.variance_dimension)
-        nn.init.xavier_uniform_(self.fc_mu.weight)
-        if self.fc_mu.bias is not None:
-            nn.init.constant_(self.fc_mu.bias, 0)
+        self.encoder_mu = nn.Linear(in_features, latent_dim)
+        self.encoder_logvar = nn.Linear(in_features, self.variance_dimension)
+        nn.init.xavier_uniform_(self.encoder_mu.weight)
+        if self.encoder_mu.bias is not None:
+            nn.init.constant_(self.encoder_mu.bias, 0)
 
-        nn.init.xavier_uniform_(self.fc_logvar.weight)
-        if self.fc_logvar.bias is not None:
-            nn.init.constant_(self.fc_logvar.bias, 0)
+        nn.init.xavier_uniform_(self.encoder_logvar.weight)
+        if self.encoder_logvar.bias is not None:
+            nn.init.constant_(self.encoder_logvar.bias, 0)
         
     def forward(self, x, edge_index=None):
         """
@@ -161,15 +161,15 @@ class MLPEncoder(nn.Module):
             logvar: Log variance of the latent distribution
         """
         # MLP layers
-        for i, mlp_layer in enumerate(self.mlp):
+        for i, mlp_layer in enumerate(self.encoder_mlp):
             x = mlp_layer(x)
             x = self.activation(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
         
         # Latent projections
-        mu = self.fc_mu(x)
+        mu = self.encoder_mu(x)
         if self.mu_activation is not None:
             mu = self.mu_activation(mu)
-        logvar = self.fc_logvar(x)
+        logvar = self.encoder_logvar(x)
         
         return mu, logvar

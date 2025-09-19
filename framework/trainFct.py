@@ -463,12 +463,13 @@ def train_phase1(
 def train_phase2(
     model: GraphVAE,
     data_loader,
+    latent_points: torch.tensor,
     num_epochs: int = 100,
     lr: float = 0.001,
     weight_decay: float = 1e-5,
     decoder_weights: Optional[Dict[str, float]] = None,
     verbose: bool = True, 
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> Dict[str, List[float]]:
     """
     Phase 2 training: Freeze encoder and train with both decoders
@@ -490,6 +491,7 @@ def train_phase2(
     model = model.to(device)
     
     # Freeze encoder
+    model.zero_grad()
     model.set_encoder_freeze(True)
     
     # Default decoder weights if not provided
@@ -547,6 +549,12 @@ def train_phase2(
             model.train()
             optimizer.zero_grad()
             outputs = model(x, edge_index=edge_index)
+
+            model.set_encoder_freeze(True)
+            # print("IS FULLY FROZEN?")
+            # print(any(p.grad is not None for p in model.encoder.parameters()))
+            # for p in model.encoder.named_parameters():
+            #     print(p)
             
             # Prepare targets
             targets = {
@@ -600,7 +608,17 @@ def train_phase2(
                   f"KL: {epoch_losses['kl_loss']:.4f} (weight: {kl_weight:.4f}), "
                   f"Adj: {epoch_losses['decoder_losses']['adj_decoder']:.4f}, "
                   f"Node: {epoch_losses['decoder_losses']['node_attr_decoder']:.4f}")
-    
+
+            if model.rbf_target is not None:
+                model.train_rbf_layer(
+                    decoder_name="node_attr_decoder",
+                    decoder_variance_target_name="node_features_logvar",
+                    latent_samples=latent_points,
+                    n_centers=16,  
+                    a=1,
+                    n_epochs= 500,
+                    lr=0.01,
+                    force=True)    
     return history
 
 
