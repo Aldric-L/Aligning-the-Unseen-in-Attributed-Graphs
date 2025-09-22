@@ -7,7 +7,8 @@ from typing import List, Dict, Any, Tuple, Optional, Union
 from tqdm import tqdm
 
 from framework.utils import *
-from framework.GraphVAE import GraphVAE, KLAnnealingScheduler
+from framework.GraphVAE import GraphVAE
+from framework.KLAnnealingScheduler import KLAnnealingScheduler
 from framework.encoder import *
 from framework.decoder import *
 

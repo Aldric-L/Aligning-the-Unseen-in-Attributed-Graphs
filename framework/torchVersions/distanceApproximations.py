@@ -2,7 +2,7 @@ import torch
 from typing import List, Callable
 import numpy as np
 
-from framework.torchVersions.boundedManifold import BoundedManifold
+from framework.boundedManifold import BoundedManifold
 
 class DistanceApproximations:
     """
