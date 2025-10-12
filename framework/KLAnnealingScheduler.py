@@ -71,4 +71,3 @@ class KLAnnealingScheduler:
             weight = self.kl_weight  # No annealing
         
         return weight * self.kl_weight
-

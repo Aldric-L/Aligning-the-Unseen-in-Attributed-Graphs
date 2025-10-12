@@ -104,7 +104,8 @@ class MLPEncoder(nn.Module):
         dropout: float = 0.1,
         activation=nn.ReLU(),
         mu_activation=None,
-        variance_dimension = None
+        variance_dimension = None,
+        clip_var: float = -1
     ):
         """
         Args:
@@ -150,6 +151,8 @@ class MLPEncoder(nn.Module):
         if self.encoder_logvar.bias is not None:
             nn.init.constant_(self.encoder_logvar.bias, 0)
         
+        self.clip_var = clip_var
+
     def forward(self, x, edge_index=None):
         """
         Forward pass through the encoder
@@ -165,11 +168,23 @@ class MLPEncoder(nn.Module):
             x = mlp_layer(x)
             x = self.activation(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-        
+
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("[Variational Encoder DEBUG] NaNs or Infs in x!", x.min().item(), x.max().item())
+
         # Latent projections
         mu = self.encoder_mu(x)
+        if torch.isnan(mu).any() or torch.isinf(mu).any():
+            print("[Variational Encoder DEBUG] NaNs or Infs in mu!", mu.min().item(), mu.max().item())
+
         if self.mu_activation is not None:
             mu = self.mu_activation(mu)
+
         logvar = self.encoder_logvar(x)
+        if torch.isnan(logvar).any() or torch.isinf(logvar).any():
+            print("[Variational Encoder DEBUG] NaNs or Infs in logvar!", logvar.min().item(), logvar.max().item())
+
+        if self.clip_var != -1:
+            logvar = torch.clip(logvar, min=-self.clip_var, max=self.clip_var)
         
         return mu, logvar

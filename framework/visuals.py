@@ -206,9 +206,9 @@ def visualize_node_features_reconstruction(model, data, sample_features=20,
                 
                 # Visualize feature reconstruction
                 plt.figure(figsize=(12, 8))
-                
-                for i in range(num_nodes):
-                    plt.subplot(num_nodes, 1, i+1)
+                count = 0
+                for i in np.random.randint(low=0, high=original_features.shape[0], size=num_nodes):
+                    plt.subplot(num_nodes, 1, count+1)
                     
                     # Original features
                     plt.plot(original_features[i, :feature_dims], 'bo-', label=f"Original (Node {i})")
@@ -220,6 +220,7 @@ def visualize_node_features_reconstruction(model, data, sample_features=20,
                     plt.ylabel("Value")
                     plt.legend()
                     plt.grid(True, alpha=0.3)
+                    count +=1
                 
                 plt.suptitle("Node Feature Reconstruction")
                 plt.tight_layout()

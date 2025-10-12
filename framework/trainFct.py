@@ -517,6 +517,10 @@ def train_phase2(
         "decoder_losses": {
             "adj_decoder": [],
             "node_attr_decoder": []
+        },
+        "detailed_losses": {
+            "adj_decoder": {},
+            "node_attr_decoder": {}
         }
     }
     
@@ -529,6 +533,10 @@ def train_phase2(
             "decoder_losses": {
                 "adj_decoder": 0.0,
                 "node_attr_decoder": 0.0
+            },
+            "detailed_losses": {
+                "adj_decoder": {},
+                "node_attr_decoder": {}
             }
         }
         
@@ -571,7 +579,7 @@ def train_phase2(
             
             # Compute loss
             loss_dict = model.compute_loss(outputs, targets, decoder_weights=decoder_weights)
-            
+            #print(loss_dict)
             # Backward pass
             loss_dict["total_loss"].backward()
             # loss_dict["total_loss"].backward(retain_graph=True)
@@ -588,6 +596,7 @@ def train_phase2(
             epoch_losses["total_loss"] += loss_dict["total_loss"].item()
             epoch_losses["kl_loss"] += loss_dict["kl_loss"].item()
             epoch_losses["recon_loss"] += loss_dict["recon_loss"].item()
+            epoch_losses["detailed_losses"] = loss_dict["detailed_losses"]
             
             for name, loss in loss_dict["decoder_losses"].items():
                 epoch_losses["decoder_losses"][name] += loss.item()
@@ -600,6 +609,12 @@ def train_phase2(
         for name in epoch_losses["decoder_losses"]:
             epoch_losses["decoder_losses"][name] /= num_batches
             history["decoder_losses"][name].append(epoch_losses["decoder_losses"][name])
+            for subname in epoch_losses["detailed_losses"][name]:
+                if subname in history["detailed_losses"][name]:
+                    history["detailed_losses"][name][subname].append(epoch_losses["detailed_losses"][name][subname].item())
+                else :
+                    history["detailed_losses"][name][subname] = [epoch_losses["detailed_losses"][name][subname].item()]
+
         
         # Print epoch summary
         if verbose and (epoch + 1) % 10 == 0:

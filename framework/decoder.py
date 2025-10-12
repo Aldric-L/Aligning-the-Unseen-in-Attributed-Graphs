@@ -118,10 +118,17 @@ class DecoderBase(nn.Module, ABC):
             Dict with total loss and component losses
         """
         # Base reconstruction loss
-        base_loss = self.compute_loss(outputs, targets)
-        loss_components = {'base_loss': base_loss}
-        total_loss = base_loss
-        
+        # base_loss = self.compute_loss(outputs, targets)
+        # loss_components = {'base_loss': base_loss}
+
+        loss_output = self.compute_loss(outputs, targets)
+        if isinstance(loss_output, dict):
+            loss_components = {'base_loss': loss_output['final_loss']}
+            loss_components.update({k: v for k, v in loss_output.items() if k != 'final_loss'})
+        else:
+            loss_components = {'base_loss': loss_output}
+        total_loss = loss_components['base_loss']
+
         # Add custom losses
         for loss_name, loss_info in self.custom_losses.items():
             if not loss_info['active']:
@@ -416,7 +423,12 @@ class NodeAttributeVariationalDecoder(DecoderBase):
         dropout: float = 0.1, 
         activation=nn.ReLU(),
         final_activation: Optional[Callable] = None,
-        name: str = "node_attr_decoder"
+        name: str = "node_attr_decoder",
+        loss_options: dict = {
+        "lambda_comp_variance": 5,
+        "lambda_decoder_variance":100.0,
+        "debug": False},
+        clip_var: float = -1
     ):
         super(NodeAttributeVariationalDecoder, self).__init__(latent_dim, name)
         
@@ -443,8 +455,19 @@ class NodeAttributeVariationalDecoder(DecoderBase):
         
         #layers.append(nn.Linear(in_features, output_dim))
         self.mlp = nn.Sequential(*layers)
+
         self.mean_head = nn.Linear(in_features, output_dim)
+        torch.nn.init.xavier_uniform_(self.mean_head.weight)
+        if self.mean_head.bias is not None:
+            torch.nn.init.constant_(self.mean_head.bias, 0)
+
         self.logvar_head = nn.Linear(in_features, output_dim)
+        torch.nn.init.xavier_uniform_(self.logvar_head.weight)
+        if self.logvar_head.bias is not None:
+            torch.nn.init.constant_(self.logvar_head.bias, 0)
+
+        self.loss_options = loss_options
+        self.clip_var = clip_var
     
     def forward(self, z: torch.Tensor, sample:bool = False,
         eps_var: float = 1e-8, **kwargs) -> Dict[str, torch.Tensor]:
@@ -460,6 +483,16 @@ class NodeAttributeVariationalDecoder(DecoderBase):
         h = self.mlp(z)
         mu_x = self.mean_head(h)
         logvar_x = self.logvar_head(h)
+
+        if torch.isnan(h).any() or torch.isinf(h).any():
+            print("[Variational Decoder DEBUG] NaNs or Infs in h!", h.min().item(), h.max().item())
+        if torch.isnan(mu_x).any() or torch.isinf(mu_x).any():
+            print("[Variational Decoder DEBUG] NaNs or Infs in mu_x!", mu_x.min().item(), mu_x.max().item())
+        if torch.isnan(logvar_x).any() or torch.isinf(logvar_x).any():
+            print("[Variational Decoder DEBUG] NaNs or Infs in logvar_x!", logvar_x.min().item(), logvar_x.max().item())
+
+        if self.clip_var != -1:
+            logvar_x = torch.clip(logvar_x, min=-self.clip_var, max=self.clip_var)
         
         # Apply final activation if specified
         if self.final_activation is not None:
@@ -477,8 +510,6 @@ class NodeAttributeVariationalDecoder(DecoderBase):
         self,
         outputs: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor],
-        lambda_comp_variance: float = 5,
-        lambda_decoder_variance: float = 100.0,
         eps_var: float = 1e-8
     ) -> torch.Tensor:
         """
@@ -487,13 +518,23 @@ class NodeAttributeVariationalDecoder(DecoderBase):
         + 2) lambda_comp_variance * mean_i[(Var_d mu_i - Var_d x_i)^2]
         + 3) lambda_decoder_variance * mean_i[(Mean_d sigma^2_i - (Var_d x_i - Var_d mu_i))^2]
         """
+        lambda_comp_variance = self.loss_options.get("lambda_comp_variance", 5)
+        lambda_decoder_variance = self.loss_options.get("lambda_decoder_variance", 100)
+        debug = self.loss_options.get("debug", False)
         mu     = outputs["node_features_mu"]      # [B, D]
         logvar = outputs["node_features_logvar"]  # [B, D]
         x      = targets["node_features"]         # [B, D]
         B, D   = x.shape
 
+        if torch.isnan(mu).any() or torch.isinf(mu).any():
+            print("[LOSS DEBUG] NaNs or Infs in mu!", mu.min().item(), mu.max().item())
+        if torch.isnan(logvar).any() or torch.isinf(logvar).any():
+            print("[LOSS DEBUG] NaNs or Infs in logvar!", logvar.min().item(), logvar.max().item())
+
         # 1) Gaussian NLL
         std   = torch.exp(0.5 * logvar) + eps_var
+        if torch.isnan(std).any() or torch.isinf(std).any():
+            print("[LOSS DEBUG] NaNs or Infs in std!", std.min().item(), std.max().item())
         dist  = torch.distributions.Normal(mu, std)
         log_p = dist.log_prob(x)                  # [B, D]
         recon_nll = -log_p.sum(dim=1).mean()      # scalar
@@ -514,7 +555,9 @@ class NodeAttributeVariationalDecoder(DecoderBase):
         residual = torch.clamp(var_emp - var_mu, min=eps_var)  # [B]
         dec_var_pen = torch.mean((mean_sigma2 - residual)**2)  # scalar
 
-        #print(f"NLL={recon_nll.item():.2f}, comp_var_pen={lambda_comp_variance*comp_var_pen.item():.2f} ({comp_var_pen.item():.2f}), var_pen={lambda_decoder_variance*dec_var_pen.item():.2f} ({dec_var_pen.item():.2f}), final pen={lambda_comp_variance*comp_var_pen.item() + lambda_decoder_variance*dec_var_pen.item():.2f}")
+        if debug:
+            print(f"lambda_decoder_variance = {lambda_decoder_variance}, lambda_comp_variance = {lambda_comp_variance}")
+            print(f"NLL={recon_nll.item():.2f}, comp_var_pen={lambda_comp_variance*comp_var_pen.item():.2f} ({comp_var_pen.item():.2f}), var_pen={lambda_decoder_variance*dec_var_pen.item():.2f} ({dec_var_pen.item():.2f}), final pen={lambda_comp_variance*comp_var_pen.item() + lambda_decoder_variance*dec_var_pen.item():.2f}")
 
         return (
             recon_nll
@@ -866,6 +909,7 @@ class LatentDistanceDecoder(DecoderBase):
         print(f"Loss: pos={pos_loss.item():.4f}, neg={neg_loss.item():.4f}, total={total_loss.item():.4f}")
         return total_loss
 
+from framework.geometry import compute_heat_kernel_from_laplacian, compute_heat_kernel_divergence, compute_graph_laplacian, compute_graph_laplacian_from_targets, compute_sigma_with_knn, compute_manifold_laplacian, check_heat_kernels_informativeness_fast, compute_heat_time_scale_from_laplacian
 
 class ManifoldHeatKernelDecoder(DecoderBase):
     """
@@ -877,35 +921,34 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         latent_dim: int,
         distance_mode: str = "linear_interpolation",  # or "direct" or "dijkstra"
         num_integration_points: int = 25,
-        metric_regularization: float = 1e-6,
         name: str = "manifold_heat_kernel_decoder",
-        # Heat kernel specific parameters
-        heat_time: Union[float, List[float]] = 1.0,  # Time parameter for heat kernel
+        num_heat_time: int = 20,  # Time parameter for heat kernel
         num_eigenvalues: int = 50,  # Number of eigenvalues to compute
         laplacian_regularization: float = 1e-8,
-        heat_kernel_approximation: str = "spectral",  # "spectral" or "finite_difference"
-        finite_diff_steps: int = 100,
-        # Manifold Laplacian construction
-        manifold_neighbors: int = 10,  # How many nearest neighbors to connect in manifold
-        gaussian_bandwidth: float = 1.0,  # Bandwidth for Gaussian weights
-        lag_factor: float = 0.5,
+        manifold_neighbors: int = 7,  # How many nearest neighbors to connect in manifold
+        ema_lag_factor: float = 0.08,
+        max_ema_epochs : int = 300,
     ):
         super(ManifoldHeatKernelDecoder, self).__init__(latent_dim, name)
         
         self.distance_mode = distance_mode
         self.num_integration_points = num_integration_points
-        self.metric_regularization = metric_regularization
         self.model = None  # Weak reference to the model instance
 
-        self.heat_times = [heat_time] if isinstance(heat_time, (float, int)) else list(heat_time)
+        self.num_heat_time = num_heat_time
         self.num_eigenvalues = num_eigenvalues
         self.laplacian_regularization = laplacian_regularization
-        self.heat_kernel_approximation = heat_kernel_approximation
-        self.finite_diff_steps = finite_diff_steps
         self.manifold_neighbors = manifold_neighbors
-        self.gaussian_bandwidth = gaussian_bandwidth
         self.sigma_ema = None
-        self.lag_factor = lag_factor
+        self.L_graph = None
+        self.K_graph = None
+        self.lag_factor = ema_lag_factor
+        self.first_sigma = None
+        self.heat_times = None
+        self.freeze_sigma = 0
+        self.sigma_inactivity_threshold = 20
+        self.max_ema_epochs = max_ema_epochs
+        self.ema_epochs = 0
 
     def giveVAEInstance(self, model):
         self.model = weakref.ref(model)
@@ -941,24 +984,11 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                 distances.append(d)
         #print(f"[riemannian_distance] Done in {time.time() - start_time:.4f}s")
         return torch.stack(distances)
-
-    def compute_manifold_laplacian(self, z: torch.Tensor, batch_size=8, normalize:bool=True, knn_for_sigma: int =7) -> torch.Tensor:
-        """
-        Compute the Laplace-Beltrami operator on the manifold using proper Riemannian distances
-        Fully differentiable using Gaussian RBF weights
-        """
+    
+    def compute_distance_matrix(self, z: torch.Tensor, batch_size=8) -> torch.Tensor:
         num_nodes = z.size(0)
         device = z.device
-        
-        # Compute all pairwise Riemannian distances
-        print("Computing pairwise Riemannian distances...")
-        # distances = torch.zeros(num_nodes, num_nodes, device=device, dtype=z.dtype)
-        
-        # for i in tqdm(range(num_nodes), desc="Computing distances"):
-        #     for j in range(i + 1, num_nodes):
-        #         dist = self._riemannian_distance(z[i], z[j])
-        #         distances[i, j] = dist
-        #         distances[j, i] = dist  # Symmetric
+        #print("Computing pairwise Riemannian distances...")
         if self.distance_mode == "dijkstra" or self.distance_mode == "Dijkstra":
             distances = self.model().get_latent_manifold().get_grid_as_graph().compute_shortest_paths(
                 self.model().get_latent_manifold()._clamp_point_to_bounds(z),
@@ -993,178 +1023,12 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                 distances[current_row_indices, current_col_indices] = current_batch_distances
                 distances[current_col_indices, current_row_indices] = current_batch_distances # Symmetric
 
-        with torch.no_grad():
-            if knn_for_sigma >= num_nodes**0.5:
-                knn_for_sigma = max(1, num_nodes**0.5 - 1)
-            # sort row-wise (excluding diagonal)
-            #sorted_dists, _ = torch.sort(distances + torch.eye(num_nodes, device=device) * 1e9, dim=1)
-            # k-th nearest: index knn_for_sigma (0-based if we excluded diag by big number)
-            #sigma_i = sorted_dists[:, knn_for_sigma].clamp(min=1e-8)  # shape (N,)
-            #sigma_i = sigma_i.clamp(min=1e-4).view(num_nodes, 1)
-            # build symmetric, locally-scaled Gaussian kernel
-            #sigma_matrix = sigma_i * sigma_i.t()  # σ_i * σ_j
-            #print("Min/Max sigma_matrix:", torch.min(sigma_matrix), torch.max(sigma_matrix))
-            alpha = self.lag_factor  # small update
-            # if self.sigma_ema is None:
-            #      self.sigma_ema = sigma_matrix
-            # else:
-            #     sigma_matrix = (1 - alpha) * self.sigma_ema + alpha * sigma_matrix
-            #     self.sigma_ema = sigma_matrix
-            # print("Min/Max sigma_matrix (corrected):", torch.min(sigma_matrix), torch.max(sigma_matrix))
-            sigma = torch.median(distances)
-            print("Selected sigma=", sigma)
-            if self.sigma_ema is None:
-                 self.sigma_ema = sigma
-            else:
-                sigma = (1 - alpha) * self.sigma_ema + alpha * sigma
-                self.sigma_ema = sigma
-            print("Corrected sigma=", sigma)
-        #weights = torch.exp(-distances**2 / (2 * self.gaussian_bandwidth**2))
-        #weights = torch.exp(- (distances ** 2) / (sigma_matrix + 1e-8))
-        weights = torch.exp(-distances**2 / (2 * sigma**2))
-
-        # zero out diagonal (no self-weight)
-        #weights.fill_diagonal_(0.0)
-        
-        # Zero out diagonal (no self-connections)
-        weights = weights * (1 - torch.eye(num_nodes, device=device))
-        
-        # Optional: Threshold very small weights to maintain some sparsity
-        threshold = 1e-4
-        weights = torch.where(weights > threshold, weights, torch.zeros_like(weights))
-        
-        # Create Laplacian: L = D - W where D is degree matrix
-        degree = torch.sum(weights, dim=1)
-        if normalize:
-            d_inv_sqrt = torch.where(degree > 0, torch.pow(degree + 1e-8, -0.5), torch.zeros_like(degree))
-            D_inv_sqrt = torch.diag(d_inv_sqrt)
-            L_manifold = torch.eye(weights.size(0)) - D_inv_sqrt @ weights @ D_inv_sqrt
-            # print("Normal laplacian:", torch.diag(degree) - weights)
-            # print("Normalized laplacian:", L_manifold)
-            # print("D_inv_sqrt:", D_inv_sqrt)
-            # print("Any NaN in L_sym?", torch.isnan(L_manifold).any().item())
-            # print("Any Inf in L_sym?", torch.isinf(L_manifold).any().item())
-        else:
-            L_manifold = torch.diag(degree) - weights
-
-        # Add regularization
-        L_manifold += self.laplacian_regularization * torch.eye(num_nodes, device=device)
-        
-        return L_manifold
-    
-    def compute_heat_kernel_spectral(self, laplacian: torch.Tensor, t: Union[float, List[float]], eigenvals=None, eigenvecs=None) -> torch.Tensor:
-        """
-        Compute heat kernel using spectral decomposition: K(t) = exp(-t*L)
-        """
-        try:
-            # if eigenvals is None or eigenvecs is None:
-            #     # Eigendecomposition of Laplacian
-            #     eigenvals, eigenvecs = torch.linalg.eigh(laplacian)
-                
-            #     # Clamp eigenvalues to avoid numerical issues
-            #     eigenvals = torch.clamp(eigenvals, min=0.0)
-            
-            # # Take only the first num_eigenvalues for efficiency
-            # if self.num_eigenvalues < eigenvals.size(0):
-            #     eigenvals = eigenvals[:self.num_eigenvalues]
-            #     eigenvecs = eigenvecs[:, :self.num_eigenvalues]
-            
-            # Compute heat kernel: K(t) = V * exp(-t*Λ) * V^T
-            if isinstance(t, (float, int)):
-                #exp_eigenvals = torch.exp(-t * eigenvals)
-                return torch.matrix_exp(-t * laplacian)
-                return eigenvecs @ torch.diag(exp_eigenvals) @ eigenvecs.t()
-            else:
-                heat_kernels = []
-                for t_i in t:
-                    #exp_eigenvals = torch.exp(-t_i * eigenvals)
-                    #K_t = eigenvecs @ torch.diag(exp_eigenvals) @ eigenvecs.t()
-                    K_t = torch.matrix_exp(-t_i * laplacian)
-                    heat_kernels.append(K_t)
-                return heat_kernels
-                        
-        except Exception as e:
-            print(f"Warning: Spectral heat kernel computation failed: {e}")
-            # Fallback to identity
-            return torch.eye(laplacian.size(0), device=laplacian.device, dtype=laplacian.dtype)
-    
-    def compute_graph_laplacian(self, targets: Dict[str, torch.Tensor], normalize: bool = True) -> torch.Tensor:
-        """
-        Compute the graph Laplacian from edge information
-        """
-        if "edge_index" in targets:
-            edge_index = targets["edge_index"]
-            num_nodes = targets.get("num_nodes", torch.max(edge_index) + 1)
-            edge_weights = targets.get("edge_labels", torch.ones(edge_index.size(1)))
-            
-            # Create adjacency matrix
-            adj = torch.zeros(num_nodes, num_nodes, device=edge_index.device, dtype=torch.float32)
-            for i in range(edge_index.size(1)):
-                src, dst = edge_index[0, i].item(), edge_index[1, i].item()
-                weight = edge_weights[i].item() if edge_weights is not None else 1.0
-                adj[src, dst] = weight
-                adj[dst, src] = weight  # Symmetric
-            
-        elif "adj_matrix" in targets:
-            adj = targets["adj_matrix"].float()
-            num_nodes = adj.size(0)
-        else:
-            raise ValueError("Targets must contain either 'edge_index' or 'adj_matrix'")
-        
-        # Compute degree matrix
-        degree = torch.sum(adj, dim=1)
-        D = torch.diag(degree)
-        
-        # Laplacian: L = D - A
-        if normalize:
-            d_inv_sqrt = torch.where(degree > 0, torch.pow(degree + 1e-8, -0.5), torch.zeros_like(degree))
-            D_inv_sqrt = torch.diag(d_inv_sqrt)
-            laplacian = torch.eye(adj.size(0)) - D_inv_sqrt @ adj @ D_inv_sqrt
-            # print("Any NaN in L_sym?", torch.isnan(laplacian).any().item())
-            # print("Any Inf in L_sym?", torch.isinf(laplacian).any().item())
-        else:
-            laplacian = D - adj
-        
-        # Add small regularization
-        laplacian += self.laplacian_regularization * torch.eye(num_nodes, device=adj.device)
-        
-        return laplacian
-    
-    def compute_heat_kernel_divergence(
-        self,
-        K_manifold: Union[torch.Tensor, List[torch.Tensor]],
-        K_graph:    Union[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
-        """
-        Compute divergence between manifold heat kernel and graph heat kernel
-        Using Frobenius norm of the difference
-        """
-        # If we got lists of kernels, compute per‐t and average:
-        if isinstance(K_manifold, (list, tuple)):
-            divergences = [
-                self.compute_heat_kernel_divergence(Km, Kg)
-                for Km, Kg in zip(K_manifold, K_graph)
-            ]
-            # average (you can also sum or weight here)
-            return torch.stack(divergences).sum()
-
-        # Normalize both kernels to have same trace for fair comparison
-        trace_manifold = torch.trace(K_manifold)
-        trace_graph    = torch.trace(K_graph)
-        
-        if trace_manifold > 1e-8:
-            K_manifold_norm = K_manifold * (trace_graph / trace_manifold)
-        else:
-            K_manifold_norm = K_manifold
-        
-        # Compute Frobenius norm of difference
-        diff = K_manifold_norm - K_graph
-        return torch.norm(diff, p='fro')
+        return distances
     
     def compute_loss(
         self,
         outputs: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor],
-        heat_kernel_weight: float = 1,
     ) -> torch.Tensor:
         """
         Compute loss based on heat kernel divergence between manifold and graph
@@ -1172,85 +1036,85 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         z = outputs["latent_codes"]
         num_nodes = z.size(0)
         
-        #print("Computing graph Laplacian...")
-        start_time = time.time()
+        distances = self.compute_distance_matrix(z)
+
+        if (self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs)  or self.sigma_ema is None:
+            with torch.no_grad():
+                sigma = compute_sigma_with_knn(distances=distances, knn_for_sigma=self.manifold_neighbors)
+            if self.sigma_ema is None:
+                self.sigma_ema = sigma
+                self.first_sigma = sigma
+            elif self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs:
+                new_sigma = (1 - self.lag_factor) * self.sigma_ema + self.lag_factor * sigma
+                if abs(self.sigma_ema - new_sigma) / self.sigma_ema < 1e-2:
+                    self.freeze_sigma += 1
+                    if self.freeze_sigma >= self.sigma_inactivity_threshold:
+                        print("Freezing sigma for non-interesting changes.")
+                    else:
+                        self.sigma_ema = new_sigma
+                else:
+                    self.sigma_ema = new_sigma
+                    self.freeze_sigma = 0
+            print("Current sigma: ", sigma.item(), "Selected sigma: ", self.sigma_ema.item())
+            self.ema_epochs += 1
+
+        L_manifold = compute_manifold_laplacian(distances=distances,
+                                                sigma=self.sigma_ema,
+                                                laplacian_regularization=self.laplacian_regularization)
+
+        #print(f"Sparsity Percentage: {torch.sum(L_manifold <= 1e-5).item()/L_manifold.numel():.2f}%")
+
+        if self.heat_times is None:
+            with torch.no_grad():
+                self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time)
+                print("Selected heat times:", self.heat_times)
+                #print("Diagnostics:", diag)
+        
         # Compute graph Laplacian
-        L_graph = self.compute_graph_laplacian(targets)
-        #print(f"[TIMER] Done in {time.time() - start_time:.4f}s")
+        if self.L_graph is None:
+            with torch.no_grad():
+                self.L_graph = compute_graph_laplacian_from_targets(targets, normalize=True, laplacian_regularization=self.laplacian_regularization)
+                self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+
+        K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
+
+        if self.ema_epochs > 2 and self.ema_epochs % 10 == 0 and self.ema_epochs < self.max_ema_epochs:
+            diagnostics, kept_mask = check_heat_kernels_informativeness_fast(
+                K_manifold,
+                trace_low_frac=1e-3,    # tune to your problem
+                trace_high_frac=0.98,
+                var_eps=1e-8,
+                diag_offdiag_ratio_min=0.05,
+                diag_offdiag_ratio_max=20.0,
+                rowstd_eps=1e-4,
+                use_power_iter=False,   # keep cheap; set True if you want slightly stronger check
+                verbose=False
+            )
+
+            if kept_mask.sum().item() > self.num_heat_time / 2:
+                # fall back: recompute heat_times (call your preprocessing) or relax thresholds
+                print("Warning: More than half of heat kernels flagged degenerate. Recomputing heat times.")
+                print("Previous heat times:", self.heat_times)
+                with torch.no_grad():
+                    self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time)
+                    print("Selected heat times:", self.heat_times)
+                    self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+                K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
+
+        divergence = compute_heat_kernel_divergence(K_manifold, self.K_graph)
         
-        #print("Computing manifold Laplacian...")
-        # Compute manifold Laplacian (this will compute Riemannian distances)
-        start_time = time.time()
-        L_manifold = self.compute_manifold_laplacian(z)
-        #print(f"[TIMER] Done in {time.time() - start_time:.4f}s")
+        with torch.no_grad():
+            L_manifold_reference = compute_manifold_laplacian(distances=distances,
+                                                              sigma=self.first_sigma,
+                                                              laplacian_regularization=self.laplacian_regularization,
+                                                              debug=True)
+            K_manifold_reference = compute_heat_kernel_from_laplacian(L_manifold_reference, self.heat_times)
 
-        #eigenvals, eigenvecs = torch.linalg.eigh(L_manifold)   
-        #print("eig min:", eigenvals.min().item(), "eig max:", eigenvals.max().item()) 
-        #eigenvals = torch.clamp(eigenvals, min=0.0)
-        num_times = 20
+            divergence_reference = compute_heat_kernel_divergence(K_manifold_reference, self.K_graph)
 
-        # # Keep only first m eigenpairs if specified
-        # if self.num_eigenvalues is not None:
-        #     eigenvals = eigenvals[:self.num_eigenvalues]
-        #     eigenvecs = eigenvecs[:, :self.num_eigenvalues]
-
-        # # Keep strictly positive eigenvalues (avoid division by 0)
-        # pos_mask = eigenvals > 1e-5
-        # if pos_mask.sum() == 0:
-        #     raise RuntimeError("No positive eigenvalues found (graph might be fully disconnected).")
-
-        # eigenvals_pos = eigenvals[pos_mask]
-        # lambda_min = eigenvals_pos.min()
-        # lambda_max = eigenvals_pos.max()
-
-        # # Normalize eigenvalues by max
-        # lambdas_tilde = eigenvals_pos / lambda_max
-        # lambda_tilde_min = lambdas_tilde.min().item()
-
-        # # Log-spaced times in normalized scale
-        # t_tilde = torch.logspace(0, torch.log10(torch.tensor(1.0/lambda_tilde_min)), steps=num_times)
-
-        # # Rescale by lambda_max
-        # heat_times = t_tilde / lambda_max
-
-        # heat_times = torch.logspace(-0.5, 1.5, steps=num_times)
-        heat_times = torch.logspace(0, 1.2, steps=num_times)
-
-        # lambda_min = eigenvals[eigenvals > 1e-6].min().item()
-        # lambda_max = eigenvals.max().item()
-
-        # # Set attenuation thresholds
-        # alpha_min = 0.8  # retain 80% of high-frequencies at t_min
-        # alpha_max = 0.1 # retain 10% of low-frequencies at t_max
-
-        # # Compute t_min and t_max
-        # t_min = -np.log(alpha_min) / lambda_max
-        # t_max = -np.log(alpha_max) / lambda_min
-
-        # Generate logspaced times between t_min and t_max
-        # heat_times = torch.logspace(start=np.log10(t_min), end=np.log10(t_max), steps=num_times).tolist()
-        # print(heat_times)
+        print(f"Total Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f}")
         
-        #print("Computing heat kernels...")
-        start_time = time.time()
-        # Compute heat kernels
-        K_graph = self.compute_heat_kernel_spectral(L_graph, heat_times)
-        K_manifold = self.compute_heat_kernel_spectral(L_manifold, heat_times)
-        #print(f"[TIMER] Done in {time.time() - start_time:.4f}s")
-        
-        #print("Computing heat kernel divergence...")
-        # Compute divergence
-        start_time = time.time()
-        divergence = self.compute_heat_kernel_divergence(K_manifold, K_graph)
-        #print(f"[TIMER] Done in {time.time() - start_time:.4f}s")
-        
-        # Total loss
-        total_loss = heat_kernel_weight * divergence
-        
-        #print(f"Heat kernel divergence: {(divergence.item()):.6f}")
-        print(f"Total Laplacian loss: {(total_loss.item()):.6f}")
-        
-        return total_loss
+        return {'final_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema}
 
 
 # DEPRECATED
