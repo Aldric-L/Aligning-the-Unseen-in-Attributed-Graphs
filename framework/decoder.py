@@ -10,7 +10,7 @@ import weakref
 import time
 
 from framework.utils import heat_kernel_distance, get_adjacency_matrix_from_tensors
-from framework.preprocessing import PreprocessingLayer, DistancePreprocessingLayer, JacobianMetricPreprocessingLayer
+from framework.preprocessing import PreprocessingLayer
 from framework.autograd import _mlp_forward_with_jacobian
 
 class DecoderBase(nn.Module, ABC):
