@@ -8,7 +8,6 @@ from tqdm import tqdm
 
 from framework.jacobianCache import JacobianGridCache
 
-# Add this to your existing framework
 class PreprocessingLayer(nn.Module, ABC):
     """
     Abstract base class for preprocessing layers that transform latent codes
@@ -585,7 +584,7 @@ class JacobianMetricPreprocessingLayer(PreprocessingLayer):
 
 # Usage example:
 """
-# Example of how to integrate this into your GraphVAE:
+# Example of how to integrate this into GraphVAE:
 
 # Define your custom metric function
 def my_metric_function(x):
