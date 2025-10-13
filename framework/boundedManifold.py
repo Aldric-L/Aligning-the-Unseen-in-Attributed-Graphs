@@ -377,46 +377,51 @@ class BoundedManifold:
         return torch.log1p(torch.relu(det_g))
     
     @staticmethod
-    def _plot_manifold_grid(values, Z1_np, Z2_np, latent_points=None, labels=None, name="Gaussian Curvature"):
+    def _plot_manifold_grid(values, Z1_np, Z2_np, latent_points=None, labels=None, name="Gaussian Curvature",
+                            graphs=2):
         if isinstance(values, torch.Tensor):
             values = values.detach().cpu().numpy()    
            
-        fig = plt.figure(figsize=(18, 6))
-        vmin, vmax = np.nanmin(values), np.nanmax(values)
-        if np.isnan(vmin) or np.isnan(vmax) or vmin == vmax: vmin, vmax = -1, 1
-        if vmin < 0 and vmax > 0:
-            absmax = np.max([np.abs(vmax), np.abs(vmin)])
-            norm = colors.TwoSlopeNorm(vmin=-absmax, vcenter=0, vmax=absmax)
-            cmap = 'RdBu_r'
-        elif vmin < 0 and vmax <= 0:
-            norm = colors.Normalize(vmin=vmin, vmax=vmax)
-            cmap = 'Blues_r'
-        else:
-            norm = colors.Normalize(vmin=vmin, vmax=vmax)
-            cmap = 'Reds'
+        with plt.rc_context({'font.family': 'sans-serif', 
+                     'font.sans-serif': ['Helvetica', 'Arial', 'DejaVu Sans']}):
+            fig = plt.figure(figsize=(18 if graphs > 2 else 12, 6), dpi=300)
+            vmin, vmax = np.nanmin(values), np.nanmax(values)
+            if np.isnan(vmin) or np.isnan(vmax) or vmin == vmax: vmin, vmax = -1, 1
+            if vmin < 0 and vmax > 0:
+                absmax = np.max([np.abs(vmax), np.abs(vmin)])
+                norm = colors.TwoSlopeNorm(vmin=-absmax, vcenter=0, vmax=absmax)
+                cmap = 'RdBu_r'
+            elif vmin < 0 and vmax <= 0:
+                norm = colors.Normalize(vmin=vmin, vmax=vmax)
+                cmap = 'Blues_r'
+            else:
+                norm = colors.Normalize(vmin=vmin, vmax=vmax)
+                cmap = 'Reds'
 
-        ax1 = fig.add_subplot(131)
-        im = ax1.pcolormesh(Z1_np, Z2_np, values, cmap=cmap, norm=norm, shading='auto')
-        ax1.set_title(f'Manifold {name} (2D View)')
-        plt.colorbar(im, ax=ax1, label=f'{name}')
+            if graphs > 2:
+                ax1 = fig.add_subplot(131)
+                im = ax1.pcolormesh(Z1_np, Z2_np, values, cmap=cmap, norm=norm, shading='auto')
+                ax1.set_title(f'Manifold {name} (2D View)')
+                plt.colorbar(im, ax=ax1, label=f'{name}')
 
-        ax2 = fig.add_subplot(132, projection='3d')
-        ax2.plot_surface(Z1_np, Z2_np, values, cmap=cmap, norm=norm)
-        ax2.set_title(f'Manifold {name} (3D Surface)')
+            ax2 = fig.add_subplot(132 if graphs > 2 else 121, projection='3d')
+            ax2.plot_surface(Z1_np, Z2_np, values, cmap=cmap, norm=norm)
+            ax2.set_title(f'Manifold {name} (3D Surface)')
 
-        ax3 = fig.add_subplot(133)
-        contour = ax3.contourf(Z1_np, Z2_np, values, 20, cmap=cmap, norm=norm)
-        ax3.set_title(f'Manifold {name} (Contour)')
-        plt.colorbar(contour, ax=ax3, label=f'{name}')
+            ax3 = fig.add_subplot(133 if graphs > 2 else 122)
+            contour = ax3.contourf(Z1_np, Z2_np, values, 20, cmap=cmap, norm=norm)
+            ax3.set_title(f'Manifold {name} (Contour)')
+            plt.colorbar(contour, ax=ax3, label=f'{name}')
 
-        if latent_points is not None:
-            points_np = latent_points.detach().cpu().numpy()                
-            labels_np = labels.detach().cpu().numpy() if labels is not None else np.zeros(len(points_np))
-            ax1.scatter(points_np[:, 0], points_np[:, 1], c=labels_np, cmap='viridis', edgecolors='k')
-            ax3.scatter(points_np[:, 0], points_np[:, 1], c=labels_np, cmap='viridis', edgecolors='k')
+            if latent_points is not None:
+                points_np = latent_points.detach().cpu().numpy()                
+                labels_np = labels.detach().cpu().numpy() if labels is not None else np.zeros(len(points_np))
+                if graphs > 2:
+                    ax1.scatter(points_np[:, 0], points_np[:, 1], c=labels_np, cmap='viridis', edgecolors='k')
+                ax3.scatter(points_np[:, 0], points_np[:, 1], c=labels_np, cmap='viridis', edgecolors='k')
 
-        plt.tight_layout()
-        plt.show()
+            plt.tight_layout()
+            plt.show()
 
     def plot_on_manifold_grid(self, function: Callable[[torch.Tensor], float], name: str,
             data_points: Union[torch.Tensor, None] = None, labels: Union[torch.Tensor, None] = None,

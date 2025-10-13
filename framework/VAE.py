@@ -188,10 +188,13 @@ class VAE(nn.Module):
         
         # KL divergence loss using pluggable prior
         mu, params = outputs["mu"], outputs["params"]
-        kl_loss = self.prior.kl_divergence(mu, params)
-        
-        # Get current KL weight from scheduler
-        kl_weight = self.kl_scheduler.get_weight()
+        if self.kl_scheduler.name != "NoKLScheduler":
+            kl_loss = self.prior.kl_divergence(mu, params)
+            
+            # Get current KL weight from scheduler
+            kl_weight = self.kl_scheduler.get_weight()
+        else:
+            kl_loss, kl_weight = torch.Tensor([0.0]), torch.Tensor([0.0])
         
         # Compute individual decoder losses
         decoder_losses = {}
@@ -203,6 +206,11 @@ class VAE(nn.Module):
         for decoder in self.decoders:
             name = decoder.name
             if name not in outputs["outputs"] or name not in active_decoders:
+                continue
+            decoder_weight = decoder_weights.get(name, 1.0)
+            if decoder_weight == 0:
+                detailed_losses[name] = {'base_loss': torch.Tensor([0.0]), 'total': torch.Tensor([0.0])}
+                decoder_losses[name] = torch.Tensor([0.0])
                 continue
                 
             # Get decoder outputs and corresponding targets
@@ -227,7 +235,6 @@ class VAE(nn.Module):
             decoder_losses[name] = decoder_loss
             
             # Add weighted loss to total reconstruction loss
-            decoder_weight = decoder_weights.get(name, 1.0)
             if decoder_weight == -1:
                 weighted_recon_loss += decoder_loss / decoder_loss.detach().item()
             else:

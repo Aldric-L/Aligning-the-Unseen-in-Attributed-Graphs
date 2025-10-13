@@ -928,6 +928,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         manifold_neighbors: int = 7,  # How many nearest neighbors to connect in manifold
         ema_lag_factor: float = 0.08,
         max_ema_epochs : int = 300,
+        ema_inactivity_threshold: int = 20,
     ):
         super(ManifoldHeatKernelDecoder, self).__init__(latent_dim, name)
         
@@ -946,7 +947,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         self.first_sigma = None
         self.heat_times = None
         self.freeze_sigma = 0
-        self.sigma_inactivity_threshold = 20
+        self.sigma_inactivity_threshold = ema_inactivity_threshold
         self.max_ema_epochs = max_ema_epochs
         self.ema_epochs = 0
 
@@ -1046,7 +1047,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                 self.first_sigma = sigma
             elif self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs:
                 new_sigma = (1 - self.lag_factor) * self.sigma_ema + self.lag_factor * sigma
-                if abs(self.sigma_ema - new_sigma) / self.sigma_ema < 1e-2:
+                if abs(self.sigma_ema - new_sigma) / self.sigma_ema < 5e-3:
                     self.freeze_sigma += 1
                     if self.freeze_sigma >= self.sigma_inactivity_threshold:
                         print("Freezing sigma for non-interesting changes.")
@@ -1107,7 +1108,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
             L_manifold_reference = compute_manifold_laplacian(distances=distances,
                                                               sigma=self.first_sigma,
                                                               laplacian_regularization=self.laplacian_regularization,
-                                                              debug=True)
+                                                              debug=False)
             K_manifold_reference = compute_heat_kernel_from_laplacian(L_manifold_reference, self.heat_times)
 
             divergence_reference = compute_heat_kernel_divergence(K_manifold_reference, self.K_graph)

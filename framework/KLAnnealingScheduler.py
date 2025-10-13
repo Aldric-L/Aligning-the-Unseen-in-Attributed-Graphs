@@ -10,7 +10,8 @@ class KLAnnealingScheduler:
         anneal_type: str = 'linear',
         anneal_start: float = 0.0,
         anneal_end: float = 1.0,
-        anneal_steps: int = 1000
+        anneal_steps: int = 1000,
+        name: str = "KLScheduler"
     ):
         """
         Args:
@@ -26,6 +27,7 @@ class KLAnnealingScheduler:
         self.anneal_end = anneal_end
         self.anneal_steps = anneal_steps
         self.current_step = 0
+        self.name = name
     
     def step(self):
         """
@@ -71,3 +73,17 @@ class KLAnnealingScheduler:
             weight = self.kl_weight  # No annealing
         
         return weight * self.kl_weight
+
+
+class NoKLScheduler(KLAnnealingScheduler):
+    """
+    Fake Scheduler for KL annealing during training when we do not need KL
+    """
+    def __init__(self):
+        super(NoKLScheduler, self).__init__(kl_weight=0.0,anneal_type= 'linear',anneal_start= 0.0,anneal_end=0.0,anneal_steps=0, name="NoKLScheduler")
+    
+    def step(self):
+        pass
+    
+    def get_weight(self) -> float:
+        return 0.0
