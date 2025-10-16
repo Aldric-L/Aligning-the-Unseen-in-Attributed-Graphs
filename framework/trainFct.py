@@ -472,7 +472,7 @@ def train_phase2(
     decoder_weights: Optional[Dict[str, float]] = None,
     verbose: bool = True, 
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    run_intermediary_diagnostics: bool = False,
+    intermediary_diagnostics: Optional[Callable[[GraphVAE, list, int], None]] = None,
 ) -> Dict[str, List[float]]:
     """
     Phase 2 training: Freeze encoder and train with both decoders
@@ -640,57 +640,8 @@ def train_phase2(
                     lr=0.01,
                     force=True)    
                 
-        if run_intermediary_diagnostics and (epoch == 0 or (epoch + 1) % 50 == 0):
-            with torch.no_grad():
-                model.encoder.eval()
-                x = data_loader[0].x.to(device)
-                edge_index = data_loader[0].edge_index.to(device)
-                latent_mu = model.encode(x, edge_index=edge_index)
-
-            latent_points = latent_mu[0]
-            #model.get_latent_manifold().visualize_manifold_curvature(data_points=latent_points)
-            curvature_decoder = model.get_decoder("adj_decoder")
-            distances = curvature_decoder.compute_distance_matrix(latent_points)
-            L_manifold = compute_manifold_laplacian(distances=distances,
-                                                    sigma=curvature_decoder.sigma_ema,
-                                                    laplacian_regularization=curvature_decoder.laplacian_regularization)
-            K_manifold = compute_heat_kernel_from_laplacian(L_manifold, curvature_decoder.heat_times)
-
-            #divergence = compute_heat_kernel_divergence(K_manifold, curvature_decoder.K_graph)
-            batch_size = 5
-            diffs_mat = None
-            diffs_mat_norm = None
-            for i in range(0, len(K_manifold), batch_size):
-                batch_K = K_manifold[i:i+batch_size]
-                batch_G = curvature_decoder.K_graph[i:i+batch_size]
-                batch_times = curvature_decoder.heat_times[i:i+batch_size]
-
-                # compute differences
-                diffs = []
-                names = []
-                for M, G, t in zip(batch_K, batch_G, batch_times):
-                    trace_manifold = torch.trace(M)
-                    trace_graph    = torch.trace(G)
-    
-                    if trace_manifold > 1e-8:
-                        K_manifold_norm = M * (trace_graph / trace_manifold)
-                    else:
-                        K_manifold_norm = M
-    
-                    # Compute Frobenius norm of difference
-                    diff = (K_manifold_norm - G)**2
-                    if diffs_mat is None:
-                        diffs_mat = diff
-                        diffs_mat_norm = diff / torch.max(diff)
-                    else:
-                        diffs_mat += diff
-                        diffs_mat_norm += diff / torch.max(diff)
-                    diffs.append(diff / torch.max(diff))
-                    names.append(f"Time={t:.2f}")
-
-                plot_correlogram(*diffs, titles=names, cmap="gist_yarg")
-            plot_correlogram(diffs_mat/ torch.max(diffs_mat), diffs_mat_norm/ torch.max(diffs_mat_norm), cmap="gist_yarg", 
-                             titles=["Total loss", "Total loss (normalized at each step)"])
+        if intermediary_diagnostics is not None and (epoch == 0 or (epoch + 1) % 50 == 0):
+            intermediary_diagnostics(model, data_loader, epoch)
 
     return history
 
