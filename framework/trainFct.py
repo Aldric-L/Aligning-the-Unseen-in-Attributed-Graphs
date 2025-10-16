@@ -640,7 +640,7 @@ def train_phase2(
                     lr=0.01,
                     force=True)    
                 
-        if run_intermediary_diagnostics and (epoch + 1) % 10 == 0:
+        if run_intermediary_diagnostics and (epoch == 0 or (epoch + 1) % 50 == 0):
             with torch.no_grad():
                 model.encoder.eval()
                 x = data_loader[0].x.to(device)
