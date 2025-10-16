@@ -472,6 +472,7 @@ def train_phase2(
     decoder_weights: Optional[Dict[str, float]] = None,
     verbose: bool = True, 
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    diagnostics_freq: int = 25,
     intermediary_diagnostics: Optional[Callable[[GraphVAE, list, int], None]] = None,
 ) -> Dict[str, List[float]]:
     """
@@ -640,7 +641,7 @@ def train_phase2(
                     lr=0.01,
                     force=True)    
                 
-        if intermediary_diagnostics is not None and (epoch == 0 or (epoch + 1) % 50 == 0):
+        if intermediary_diagnostics is not None and (epoch == 0 or (epoch + 1) % diagnostics_freq == 0):
             intermediary_diagnostics(model, data_loader, epoch)
 
     return history

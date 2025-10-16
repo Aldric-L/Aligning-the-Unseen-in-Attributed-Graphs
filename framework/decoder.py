@@ -929,6 +929,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         ema_lag_factor: float = 0.08,
         max_ema_epochs : int = 300,
         ema_inactivity_threshold: int = 20,
+        dist_distorsion_penalty: float = 0.0,
     ):
         super(ManifoldHeatKernelDecoder, self).__init__(latent_dim, name)
         
@@ -951,6 +952,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         self.max_ema_epochs = max_ema_epochs
         self.ema_epochs = 0
         self.mean_distance = None
+        self.dist_distorsion_penalty = dist_distorsion_penalty
 
     def giveVAEInstance(self, model):
         self.model = weakref.ref(model)
@@ -1056,10 +1058,10 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                     self.freeze_sigma += 1
                     if self.freeze_sigma >= self.sigma_inactivity_threshold:
                         print("Freezing sigma for non-interesting changes.")
+                        L_manifold = compute_manifold_laplacian(distances=distances,
+                                            sigma=self.sigma_ema,
+                                            laplacian_regularization=self.laplacian_regularization)
                         with torch.no_grad():
-                            L_manifold = compute_manifold_laplacian(distances=distances,
-                                                sigma=self.sigma_ema,
-                                                laplacian_regularization=self.laplacian_regularization)
                             self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, retain_high_freq_threshold= 0.9, suppress_low_freq_threshold = 5e-3)
                             print("Selected heat times:", self.heat_times)
                             self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
@@ -1129,11 +1131,14 @@ class ManifoldHeatKernelDecoder(DecoderBase):
 
             divergence_reference = compute_heat_kernel_divergence(K_manifold_reference, self.K_graph)
         
-        dist_div = (distances.mean() - self.mean_distance)**2
-
-        print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f} - Distance deviation loss: {(dist_div.item()):.6f}")
+        if self.dist_distorsion_penalty > 0:
+            dist_div = (distances.mean() - self.mean_distance)**2
+            print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f} - Distance deviation loss: {(dist_div.item()):.6f}")
+            return {'final_loss': divergence + self.dist_distorsion_penalty * dist_div, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema, "dist_loss": dist_div}
         
-        return {'final_loss': divergence + 0.5 * dist_div, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema, "dist_loss": dist_div}
+        print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f}")
+        return {'final_loss': divergence, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema}
+
 
 
 # DEPRECATED
