@@ -99,7 +99,7 @@ def compute_graph_laplacian(adjacency_matrix: torch.tensor, normalize: bool = Tr
     
     return laplacian
 
-def compute_graph_laplacian_from_targets(targets: Dict[str, torch.Tensor], normalize: bool = True, laplacian_regularization : float = 0) -> torch.Tensor:
+def compute_graph_laplacian_from_targets(targets: Dict[str, torch.Tensor], normalize: bool = True, laplacian_regularization : float = 0, threshold_eps: float = 1e-6, debug: bool = False,) -> torch.Tensor:
     """
     Compute the graph Laplacian from edge information
     """
@@ -122,7 +122,31 @@ def compute_graph_laplacian_from_targets(targets: Dict[str, torch.Tensor], norma
     else:
         raise ValueError("Targets must contain either 'edge_index' or 'adj_matrix'")
     
-    return compute_graph_laplacian(adjacency_matrix=adj, normalize=normalize, laplacian_regularization=laplacian_regularization)
+    sigma = compute_sigma_with_knn(adj)
+    weights = torch.exp(-adj**2 / (2 * sigma**2))
+
+    # --- Zero out diagonal safely (autograd-friendly) ---
+    eye = torch.eye(weights.size(0), device=weights.device)
+    weights = weights * (1 - eye)
+
+    # --- Compute cutoff distance based on sigma and epsilon ---
+    d_cut = sigma * torch.sqrt(-2 * torch.log(torch.tensor(threshold_eps, device=weights.device)))
+    w_cut = torch.exp(-(1.2 * d_cut)**2 / (2 * sigma**2))  # == threshold_eps numerically
+
+    # --- Threshold small weights (sparsify, but remain differentiable) ---
+    weights = torch.where(weights > w_cut, weights, torch.zeros_like(weights))
+
+    # --- Debug information ---
+    if debug:
+        nonzero_frac = (weights > 0).float().mean().item()
+        energy_retained = weights.sum().item() / (torch.exp(-adj**2 / (2 * sigma**2)).sum().item() + 1e-12)
+        print(
+            f"[DEBUG] (From Existing Graph) RBF sparsity: {(1 - nonzero_frac) * 100:.2f}% zeros | "
+            f"Energy retained: {energy_retained * 100:.3f}% | "
+            f"Cutoff weight={w_cut.item():.2e}"
+        )
+    
+    return compute_graph_laplacian(adjacency_matrix=weights, normalize=normalize, laplacian_regularization=laplacian_regularization)
         
 
 def compute_sigma_with_knn(distances: torch.Tensor, knn_for_sigma: int =7):
@@ -208,7 +232,7 @@ def compute_manifold_laplacian(
         nonzero_frac = (weights > 0).float().mean().item()
         energy_retained = weights.sum().item() / (torch.exp(-distances**2 / (2 * sigma**2)).sum().item() + 1e-12)
         print(
-            f"[DEBUG] RBF sparsity: {(1 - nonzero_frac) * 100:.2f}% zeros | "
+            f"[DEBUG] (From Laplacian) RBF sparsity: {(1 - nonzero_frac) * 100:.2f}% zeros | "
             f"Energy retained: {energy_retained * 100:.3f}% | "
             f"Cutoff weight={w_cut.item():.2e}"
         )

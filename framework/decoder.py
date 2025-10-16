@@ -950,6 +950,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         self.sigma_inactivity_threshold = ema_inactivity_threshold
         self.max_ema_epochs = max_ema_epochs
         self.ema_epochs = 0
+        self.mean_distance = None
 
     def giveVAEInstance(self, model):
         self.model = weakref.ref(model)
@@ -1036,8 +1037,12 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         """
         z = outputs["latent_codes"]
         num_nodes = z.size(0)
+        ht_recomputed = False
         
         distances = self.compute_distance_matrix(z)
+        if self.mean_distance is None:
+            with torch.no_grad():
+                self.mean_distance = distances.mean()
 
         if (self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs)  or self.sigma_ema is None:
             with torch.no_grad():
@@ -1051,6 +1056,15 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                     self.freeze_sigma += 1
                     if self.freeze_sigma >= self.sigma_inactivity_threshold:
                         print("Freezing sigma for non-interesting changes.")
+                        with torch.no_grad():
+                            L_manifold = compute_manifold_laplacian(distances=distances,
+                                                sigma=self.sigma_ema,
+                                                laplacian_regularization=self.laplacian_regularization)
+                            self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time)
+                            print("Selected heat times:", self.heat_times)
+                            self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+                            ht_recomputed = True
+                        K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
                     else:
                         self.sigma_ema = new_sigma
                 else:
@@ -1059,9 +1073,10 @@ class ManifoldHeatKernelDecoder(DecoderBase):
             print("Current sigma: ", sigma.item(), "Selected sigma: ", self.sigma_ema.item())
             self.ema_epochs += 1
 
-        L_manifold = compute_manifold_laplacian(distances=distances,
-                                                sigma=self.sigma_ema,
-                                                laplacian_regularization=self.laplacian_regularization)
+        if not ht_recomputed:
+            L_manifold = compute_manifold_laplacian(distances=distances,
+                                                    sigma=self.sigma_ema,
+                                                    laplacian_regularization=self.laplacian_regularization)
 
         #print(f"Sparsity Percentage: {torch.sum(L_manifold <= 1e-5).item()/L_manifold.numel():.2f}%")
 
@@ -1079,7 +1094,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
 
         K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
 
-        if self.ema_epochs > 2 and self.ema_epochs % 10 == 0 and self.ema_epochs < self.max_ema_epochs:
+        if not ht_recomputed and self.ema_epochs > 2 and self.ema_epochs % 10 == 0 and self.ema_epochs < self.max_ema_epochs:
             diagnostics, kept_mask = check_heat_kernels_informativeness_fast(
                 K_manifold,
                 trace_low_frac=1e-3,    # tune to your problem
@@ -1101,6 +1116,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                     print("Selected heat times:", self.heat_times)
                     self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
                 K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
+                self.freeze_sigma = 0
 
         divergence = compute_heat_kernel_divergence(K_manifold, self.K_graph)
         
@@ -1112,10 +1128,12 @@ class ManifoldHeatKernelDecoder(DecoderBase):
             K_manifold_reference = compute_heat_kernel_from_laplacian(L_manifold_reference, self.heat_times)
 
             divergence_reference = compute_heat_kernel_divergence(K_manifold_reference, self.K_graph)
-
-        print(f"Total Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f}")
         
-        return {'final_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema}
+        dist_div = (distances.mean() - self.mean_distance)**2
+
+        print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f} - Distance deviation loss: {(dist_div.item()):.6f}")
+        
+        return {'final_loss': divergence + 0.5 * dist_div, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema, "dist_loss": dist_div}
 
 
 # DEPRECATED
