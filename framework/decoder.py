@@ -1060,7 +1060,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                             L_manifold = compute_manifold_laplacian(distances=distances,
                                                 sigma=self.sigma_ema,
                                                 laplacian_regularization=self.laplacian_regularization)
-                            self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time)
+                            self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, retain_high_freq_threshold= 0.9, suppress_low_freq_threshold = 5e-3)
                             print("Selected heat times:", self.heat_times)
                             self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
                             ht_recomputed = True
@@ -1082,7 +1082,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
 
         if self.heat_times is None:
             with torch.no_grad():
-                self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time)
+                self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, retain_high_freq_threshold= 0.9, suppress_low_freq_threshold = 5e-3)
                 print("Selected heat times:", self.heat_times)
                 #print("Diagnostics:", diag)
         

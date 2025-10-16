@@ -397,8 +397,8 @@ def compute_heat_time_scale_from_laplacian(
     retain_high_freq_threshold: float = 0.95,   # a in notes: e^{-t_min * lambda_max} >= a
     suppress_low_freq_threshold: float = 1e-3,  # b in notes: e^{-t_max * lambda_2} <= b
     trace_eps: float = 1e-4,                    # remove times where K trace is ~0
-    clamp_min_log: float = -12.0,               # avoid extremely small times in log-space
-    clamp_max_log: float = 12.0,                # avoid extremely large times in log-space
+    clamp_min_log: float = -4.0,               # avoid extremely small times in log-space
+    clamp_max_log: float = 2.0,                # avoid extremely large times in log-space
     eigen_compute_method: str = "full",         # "full" or "approx" (approx not implemented here)
     return_diagnostics: bool = True,
 ) -> Tuple[torch.Tensor, Optional[Dict]]:
@@ -456,9 +456,9 @@ def compute_heat_time_scale_from_laplacian(
     # --- derive t_min and t_max from thresholds ---
     # t_min: keep high-frequency content up to lambda_max with factor `retain_high_freq_threshold`
     # t_min <= -ln(a) / lambda_max
-    t_min = -torch.log(torch.tensor(retain_high_freq_threshold, dtype=torch.float64)) / float(lambda_max)
+    t_min = -torch.log10(torch.tensor(retain_high_freq_threshold, dtype=torch.float64)) / float(lambda_max)
     # t_max: suppress non-zero modes up to lambda_pos_min with factor `suppress_low_freq_threshold`
-    t_max = -torch.log(torch.tensor(suppress_low_freq_threshold, dtype=torch.float64)) / float(lambda_pos_min)
+    t_max = -torch.log10(torch.tensor(suppress_low_freq_threshold, dtype=torch.float64)) / float(lambda_pos_min)
 
     # numeric clamps on log scale to avoid extremes
     # compute logs then clamp
