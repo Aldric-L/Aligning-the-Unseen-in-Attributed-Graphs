@@ -1059,27 +1059,76 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         """
         z = outputs["latent_codes"]
         distances = self.compute_distance_matrix(z)
-        if self.L_graph is None or self.heat_times is None:
+
+        if "edge_index" in targets:
+            edge_index = targets["edge_index"]
+            num_nodes = targets.get("num_nodes", torch.max(edge_index) + 1)
+            edge_weights = targets.get("edge_labels", torch.ones(edge_index.size(1)))
+            
+            # Create adjacency matrix
+            adj = torch.zeros(num_nodes, num_nodes, device=edge_index.device, dtype=torch.float32)
+            for i in range(edge_index.size(1)):
+                src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+                weight = edge_weights[i].item() if edge_weights is not None else 1.0
+                adj[src, dst] = weight
+                adj[dst, src] = weight  # Symmetric
+            
+        elif "adj_matrix" in targets:
+            adj = targets["adj_matrix"].float()
+            num_nodes = adj.size(0)
+
+        if self.heat_times is None:
             with torch.no_grad():
                 self.L_graph = compute_graph_laplacian_from_targets(targets, normalize=True, laplacian_regularization=self.laplacian_regularization)
                 if self.heat_times is None:
                     self.heat_times = self.get_spectral_heat_times(eigenvalues=torch.clamp(torch.linalg.eigvalsh(self.L_graph),min=0.0), num_times=self.num_heat_time)
                 print("Selected heat times:", self.heat_times)
-                self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+                #self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
 
         dist_sq = distances.pow(2).unsqueeze(-1)
         coeffs = (4 * torch.pi * self.heat_times).pow(-self.latent_dim / 2)
         exp_term = torch.exp(-dist_sq / (4 * self.heat_times))
         kernel_stack = coeffs * exp_term
-        manifold_heat_kernels = list(torch.unbind(kernel_stack, dim=-1))
+        #manifold_heat_kernels = list(torch.unbind(kernel_stack, dim=-1))
 
         # Compute the divergence between the manifold and graph heat kernels
-        divergence = 0
-        for i, (K_manifold, K_graph) in enumerate(zip(manifold_heat_kernels, self.K_graph)):
-            #print("For heat time", self.heat_times[i].item(), ":", torch.norm(K_manifold - K_graph, p=1))
-            divergence += torch.norm(K_manifold - K_graph, p=1)
+        divergence = (adj-kernel_stack.sum(dim=-1)).pow(2).sum()
+        
         print(f"Current HK loss: {(divergence.item()):.6f}")
         return {'final_loss': divergence}
+
+
+    # def compute_loss(
+    #     self,
+    #     outputs: Dict[str, torch.Tensor],
+    #     targets: Dict[str, torch.Tensor],
+    # ) -> torch.Tensor:
+    #     """
+    #     Compute loss based on heat kernel divergence between manifold and graph
+    #     """
+    #     z = outputs["latent_codes"]
+    #     distances = self.compute_distance_matrix(z)
+    #     if self.L_graph is None or self.heat_times is None:
+    #         with torch.no_grad():
+    #             self.L_graph = compute_graph_laplacian_from_targets(targets, normalize=True, laplacian_regularization=self.laplacian_regularization)
+    #             if self.heat_times is None:
+    #                 self.heat_times = self.get_spectral_heat_times(eigenvalues=torch.clamp(torch.linalg.eigvalsh(self.L_graph),min=0.0), num_times=self.num_heat_time)
+    #             print("Selected heat times:", self.heat_times)
+    #             self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+
+    #     dist_sq = distances.pow(2).unsqueeze(-1)
+    #     coeffs = (4 * torch.pi * self.heat_times).pow(-self.latent_dim / 2)
+    #     exp_term = torch.exp(-dist_sq / (4 * self.heat_times))
+    #     kernel_stack = coeffs * exp_term
+    #     manifold_heat_kernels = list(torch.unbind(kernel_stack, dim=-1))
+
+    #     # Compute the divergence between the manifold and graph heat kernels
+    #     divergence = 0
+    #     for i, (K_manifold, K_graph) in enumerate(zip(manifold_heat_kernels, self.K_graph)):
+    #         #print("For heat time", self.heat_times[i].item(), ":", torch.norm(K_manifold - K_graph, p=1))
+    #         divergence += torch.norm(K_manifold - K_graph, p=1)
+    #     print(f"Current HK loss: {(divergence.item()):.6f}")
+    #     return {'final_loss': divergence}
 
 # class ManifoldHeatKernelDecoder(DecoderBase):
 #     """
