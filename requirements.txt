@@ -1,0 +1,11 @@
+igraph
+matplotlib
+networkx
+numpy
+scikit-learn
+scipy
+seaborn
+torch
+torchdiffeq
+torch_geometric
+tqdm

@@ -911,6 +911,7 @@ class LatentDistanceDecoder(DecoderBase):
 
 from framework.geometry import compute_heat_kernel_from_laplacian, compute_heat_kernel_divergence, compute_graph_laplacian, compute_graph_laplacian_from_targets, compute_sigma_with_knn, compute_manifold_laplacian, check_heat_kernels_informativeness_fast, compute_heat_time_scale_from_laplacian
 
+
 class ManifoldHeatKernelDecoder(DecoderBase):
     """
     Fictive decoder that outputs latent codes but computes a meaningful loss 
@@ -1033,6 +1034,21 @@ class ManifoldHeatKernelDecoder(DecoderBase):
 
         return distances
     
+    def get_spectral_heat_times(self, eigenvalues, num_times=5):
+        # Filter out the zero eigenvalue (connected component)
+        valid_eigs = eigenvalues[eigenvalues > 1e-5]
+        
+        lambda_max = valid_eigs.max()
+        lambda_min = valid_eigs.min() # This is roughly lambda_2
+        
+        # Invert to get time scales
+        t_min = 1.0 / lambda_max
+        t_max = 1.0 / lambda_min
+        
+        # Create log-spaced times
+        # We often multiply t_max by a factor (e.g., 2 or 4) to ensure full global coverage
+        return torch.logspace(torch.log10(t_min), torch.log10(t_max * 4), num_times)
+    
     def compute_loss(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -1042,112 +1058,266 @@ class ManifoldHeatKernelDecoder(DecoderBase):
         Compute loss based on heat kernel divergence between manifold and graph
         """
         z = outputs["latent_codes"]
-        num_nodes = z.size(0)
-        ht_recomputed = False
-        
         distances = self.compute_distance_matrix(z)
-        if self.mean_distance is None:
-            with torch.no_grad():
-                self.mean_distance = distances.mean()
-
-        if (self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs)  or self.sigma_ema is None:
-            with torch.no_grad():
-                sigma = compute_sigma_with_knn(distances=distances, knn_for_sigma=self.manifold_neighbors)
-            if self.sigma_ema is None:
-                self.sigma_ema = sigma
-                self.first_sigma = sigma
-            elif self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs:
-                new_sigma = (1 - self.lag_factor) * self.sigma_ema + self.lag_factor * sigma
-                if abs(self.sigma_ema - new_sigma) / self.sigma_ema < 5e-3:
-                    self.freeze_sigma += 1
-                    if self.freeze_sigma >= self.sigma_inactivity_threshold:
-                        print("Freezing sigma for non-interesting changes.")
-                        L_manifold = compute_manifold_laplacian(distances=distances,
-                                            sigma=self.sigma_ema,
-                                            laplacian_regularization=self.laplacian_regularization)
-                        with torch.no_grad():
-                            self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, 
-                                                                                           retain_high_freq_threshold=self.retain_high_freq_threshold, 
-                                                                                           suppress_low_freq_threshold = self.suppress_low_freq_threshold)
-                            print("Selected heat times:", self.heat_times)
-                            self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
-                            ht_recomputed = True
-                        K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
-                    else:
-                        self.sigma_ema = new_sigma
-                else:
-                    self.sigma_ema = new_sigma
-                    self.freeze_sigma = 0
-            print("Current sigma: ", sigma.item(), "Selected sigma: ", self.sigma_ema.item())
-            self.ema_epochs += 1
-
-        if not ht_recomputed:
-            L_manifold = compute_manifold_laplacian(distances=distances,
-                                                    sigma=self.sigma_ema,
-                                                    laplacian_regularization=self.laplacian_regularization)
-
-        #print(f"Sparsity Percentage: {torch.sum(L_manifold <= 1e-5).item()/L_manifold.numel():.2f}%")
-
-        if self.heat_times is None:
-            with torch.no_grad():
-                self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, 
-                                                                               retain_high_freq_threshold=self.retain_high_freq_threshold, 
-                                                                               suppress_low_freq_threshold = self.suppress_low_freq_threshold)
-                print("Selected heat times:", self.heat_times)
-                #print("Diagnostics:", diag)
-        
-        # Compute graph Laplacian
-        if self.L_graph is None:
+        if self.L_graph is None or self.heat_times is None:
             with torch.no_grad():
                 self.L_graph = compute_graph_laplacian_from_targets(targets, normalize=True, laplacian_regularization=self.laplacian_regularization)
+                if self.heat_times is None:
+                    self.heat_times = self.get_spectral_heat_times(eigenvalues=torch.clamp(torch.linalg.eigvalsh(self.L_graph),min=0.0), num_times=self.num_heat_time)
+                print("Selected heat times:", self.heat_times)
                 self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
 
-        K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
+        dist_sq = distances.pow(2).unsqueeze(-1)
+        coeffs = (4 * torch.pi * self.heat_times).pow(-self.latent_dim / 2)
+        exp_term = torch.exp(-dist_sq / (4 * self.heat_times))
+        kernel_stack = coeffs * exp_term
+        manifold_heat_kernels = list(torch.unbind(kernel_stack, dim=-1))
 
-        if not ht_recomputed and self.ema_epochs > 2 and self.ema_epochs % 10 == 0 and self.ema_epochs < self.max_ema_epochs:
-            diagnostics, kept_mask = check_heat_kernels_informativeness_fast(
-                K_manifold,
-                trace_low_frac=1e-3,    # tune to your problem
-                trace_high_frac=0.98,
-                var_eps=1e-8,
-                diag_offdiag_ratio_min=0.05,
-                diag_offdiag_ratio_max=20.0,
-                rowstd_eps=1e-4,
-                use_power_iter=False,   # keep cheap; set True if you want slightly stronger check
-                verbose=False
-            )
+        # Compute the divergence between the manifold and graph heat kernels
+        divergence = 0
+        for i, (K_manifold, K_graph) in enumerate(zip(manifold_heat_kernels, self.K_graph)):
+            #print("For heat time", self.heat_times[i].item(), ":", torch.norm(K_manifold - K_graph, p=1))
+            divergence += torch.norm(K_manifold - K_graph, p=1)
+        print(f"Current HK loss: {(divergence.item()):.6f}")
+        return {'final_loss': divergence}
 
-            if kept_mask.sum().item() > self.num_heat_time / 2:
-                # fall back: recompute heat_times (call your preprocessing) or relax thresholds
-                print("Warning: More than half of heat kernels flagged degenerate. Recomputing heat times.")
-                print("Previous heat times:", self.heat_times)
-                with torch.no_grad():
-                    self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, 
-                                                                                   retain_high_freq_threshold=self.retain_high_freq_threshold, 
-                                                                                   suppress_low_freq_threshold = self.suppress_low_freq_threshold)
-                    print("Selected heat times:", self.heat_times)
-                    self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
-                K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
-                self.freeze_sigma = 0
-
-        divergence = compute_heat_kernel_divergence(K_manifold, self.K_graph)
+# class ManifoldHeatKernelDecoder(DecoderBase):
+#     """
+#     Fictive decoder that outputs latent codes but computes a meaningful loss 
+#     based on manifold heat kernel divergence with graph Laplacian.
+#     """
+#     def __init__(
+#         self, 
+#         latent_dim: int,
+#         distance_mode: str = "linear_interpolation",  # or "direct" or "dijkstra"
+#         num_integration_points: int = 25,
+#         name: str = "manifold_heat_kernel_decoder",
+#         num_heat_time: int = 20,  # Time parameter for heat kernel
+#         num_eigenvalues: int = 50,  # Number of eigenvalues to compute
+#         laplacian_regularization: float = 1e-8,
+#         manifold_neighbors: int = 7,  # How many nearest neighbors to connect in manifold
+#         ema_lag_factor: float = 0.08,
+#         max_ema_epochs : int = 300,
+#         ema_inactivity_threshold: int = 20,
+#         dist_distorsion_penalty: float = 0.0,
+#         retain_high_freq_threshold: float = 0.9,
+#         suppress_low_freq_threshold: float = 5e-3,
+#     ):
+#         super(ManifoldHeatKernelDecoder, self).__init__(latent_dim, name)
         
-        with torch.no_grad():
-            L_manifold_reference = compute_manifold_laplacian(distances=distances,
-                                                              sigma=self.first_sigma,
-                                                              laplacian_regularization=self.laplacian_regularization,
-                                                              debug=False)
-            K_manifold_reference = compute_heat_kernel_from_laplacian(L_manifold_reference, self.heat_times)
+#         self.distance_mode = distance_mode
+#         self.num_integration_points = num_integration_points
+#         self.model = None  # Weak reference to the model instance
 
-            divergence_reference = compute_heat_kernel_divergence(K_manifold_reference, self.K_graph)
+#         self.num_heat_time = num_heat_time
+#         self.num_eigenvalues = num_eigenvalues
+#         self.laplacian_regularization = laplacian_regularization
+#         self.manifold_neighbors = manifold_neighbors
+#         self.sigma_ema = None
+#         self.L_graph = None
+#         self.K_graph = None
+#         self.lag_factor = ema_lag_factor
+#         self.first_sigma = None
+#         self.heat_times = None
+#         self.freeze_sigma = 0
+#         self.sigma_inactivity_threshold = ema_inactivity_threshold
+#         self.max_ema_epochs = max_ema_epochs
+#         self.ema_epochs = 0
+#         self.mean_distance = None
+#         self.dist_distorsion_penalty = dist_distorsion_penalty
+#         self.retain_high_freq_threshold = retain_high_freq_threshold
+#         self.suppress_low_freq_threshold = suppress_low_freq_threshold
+
+#     def giveVAEInstance(self, model):
+#         self.model = weakref.ref(model)
+
+#     def forward(self, z: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+#         """Forward pass - simply returns the latent codes (fictive decoder)"""
+#         return {"latent_codes": z.clone()}
         
-        if self.dist_distorsion_penalty > 0:
-            dist_div = (distances.mean() - self.mean_distance)**2
-            print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f} - Distance deviation loss: {(dist_div.item()):.6f}")
-            return {'final_loss': divergence + self.dist_distorsion_penalty * dist_div, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema, "dist_loss": dist_div}
+#     def _riemannian_distance(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+#         #print(f"[riemannian_distance] Computing pairwise distances for batch size {z.shape[0]}")
+#         #start_time = time.time()
+#         if self.model is None or self.model() is None:
+#             raise ValueError("Model instance not set. Call giveVAEInstance(model) first.")
+#         model = self.model()
+
+#         distances = []
+#         if z1.ndim == 1:
+#             z1 = z1.unsqueeze(0)
+#         if z2.ndim == 1:
+#             z2 = z2.unsqueeze(0)
+#         if self.distance_mode == "linear_interpolation":
+#             return model.get_latent_manifold().linear_interpolation_distance(z1, z2, num_points=self.num_integration_points)
+#         else:
+#             for i, (u_vec, v_vec) in enumerate(zip(z1, z2)):
+#                 if self.distance_mode == "linear_interpolation":
+#                     #d = DistanceApproximations.linear_interpolation_distance(model.get_latent_manifold(), u_vec, v_vec, 
+#                     #                                                         num_points=self.num_integration_points)
+#                     d = model.get_latent_manifold().linear_interpolation_distance(u_vec, v_vec, 
+#                                                                                     num_points=self.num_integration_points)
+#                 else:
+#                     d = model.get_latent_manifold().exact_geodesic_distance(u_vec, v_vec)
+#                 #print(f"  [distance] Sample {i}: {d.item():.4f}")
+#                 distances.append(d)
+#         #print(f"[riemannian_distance] Done in {time.time() - start_time:.4f}s")
+#         return torch.stack(distances)
+    
+#     def compute_distance_matrix(self, z: torch.Tensor, batch_size=8) -> torch.Tensor:
+#         num_nodes = z.size(0)
+#         device = z.device
+#         #print("Computing pairwise Riemannian distances...")
+#         if self.distance_mode == "dijkstra" or self.distance_mode == "Dijkstra":
+#             distances = self.model().get_latent_manifold().get_grid_as_graph().compute_shortest_paths(
+#                 self.model().get_latent_manifold()._clamp_point_to_bounds(z),
+#                 weight_type="geodesic",  
+#                 max_grid_neighbors=8,     # Connect to up to 8 nearest grid nodes
+#                 num_threads=6
+#             )
+#         else:
+#             distances = torch.zeros(num_nodes, num_nodes, device=z.device)
+#             row_indices, col_indices = torch.triu_indices(num_nodes, num_nodes, offset=1)
+#             total_pairs = len(row_indices)
+
+#             # Process in mini-batches
+#             for i in tqdm(range(0, total_pairs, batch_size), desc="Computing distances in batches"):
+#                 batch_start = i
+#                 batch_end = min(i + batch_size, total_pairs)
+
+#                 # Get the current batch of indices
+#                 current_row_indices = row_indices[batch_start:batch_end]
+#                 current_col_indices = col_indices[batch_start:batch_end]
+
+#                 # Extract the corresponding node embeddings for these pairs
+#                 u_batch = z[current_row_indices]
+#                 v_batch = z[current_col_indices]
+
+#                 # Compute distances for this mini-batch
+#                 current_batch_distances = self._riemannian_distance(
+#                     u_batch, v_batch
+#                 )
+
+#                 # Populate the distance matrix with the results of this batch
+#                 distances[current_row_indices, current_col_indices] = current_batch_distances
+#                 distances[current_col_indices, current_row_indices] = current_batch_distances # Symmetric
+
+#         return distances
+    
+#     def compute_loss(
+#         self,
+#         outputs: Dict[str, torch.Tensor],
+#         targets: Dict[str, torch.Tensor],
+#     ) -> torch.Tensor:
+#         """
+#         Compute loss based on heat kernel divergence between manifold and graph
+#         """
+#         z = outputs["latent_codes"]
+#         num_nodes = z.size(0)
+#         ht_recomputed = False
         
-        print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f}")
-        return {'final_loss': divergence, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema}
+#         distances = self.compute_distance_matrix(z)
+#         if self.mean_distance is None:
+#             with torch.no_grad():
+#                 self.mean_distance = distances.mean()
+
+#         if (self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs)  or self.sigma_ema is None:
+#             with torch.no_grad():
+#                 sigma = compute_sigma_with_knn(distances=distances, knn_for_sigma=self.manifold_neighbors)
+#             if self.sigma_ema is None:
+#                 self.sigma_ema = sigma
+#                 self.first_sigma = sigma
+#             elif self.freeze_sigma < self.sigma_inactivity_threshold and self.ema_epochs < self.max_ema_epochs:
+#                 new_sigma = (1 - self.lag_factor) * self.sigma_ema + self.lag_factor * sigma
+#                 if abs(self.sigma_ema - new_sigma) / self.sigma_ema < 5e-3:
+#                     self.freeze_sigma += 1
+#                     if self.freeze_sigma >= self.sigma_inactivity_threshold:
+#                         print("Freezing sigma for non-interesting changes.")
+#                         L_manifold = compute_manifold_laplacian(distances=distances,
+#                                             sigma=self.sigma_ema,
+#                                             laplacian_regularization=self.laplacian_regularization)
+#                         with torch.no_grad():
+#                             self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, 
+#                                                                                            retain_high_freq_threshold=self.retain_high_freq_threshold, 
+#                                                                                            suppress_low_freq_threshold = self.suppress_low_freq_threshold)
+#                             print("Selected heat times:", self.heat_times)
+#                             self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+#                             ht_recomputed = True
+#                         K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
+#                     else:
+#                         self.sigma_ema = new_sigma
+#                 else:
+#                     self.sigma_ema = new_sigma
+#                     self.freeze_sigma = 0
+#             print("Current sigma: ", sigma.item(), "Selected sigma: ", self.sigma_ema.item())
+#             self.ema_epochs += 1
+
+#         if not ht_recomputed:
+#             L_manifold = compute_manifold_laplacian(distances=distances,
+#                                                     sigma=self.sigma_ema,
+#                                                     laplacian_regularization=self.laplacian_regularization)
+
+#         #print(f"Sparsity Percentage: {torch.sum(L_manifold <= 1e-5).item()/L_manifold.numel():.2f}%")
+
+#         if self.heat_times is None:
+#             with torch.no_grad():
+#                 self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, 
+#                                                                                retain_high_freq_threshold=self.retain_high_freq_threshold, 
+#                                                                                suppress_low_freq_threshold = self.suppress_low_freq_threshold)
+#                 print("Selected heat times:", self.heat_times)
+#                 #print("Diagnostics:", diag)
+        
+#         # Compute graph Laplacian
+#         if self.L_graph is None:
+#             with torch.no_grad():
+#                 self.L_graph = compute_graph_laplacian_from_targets(targets, normalize=True, laplacian_regularization=self.laplacian_regularization)
+#                 self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+
+#         K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
+
+#         if not ht_recomputed and self.ema_epochs > 2 and self.ema_epochs % 10 == 0 and self.ema_epochs < self.max_ema_epochs:
+#             diagnostics, kept_mask = check_heat_kernels_informativeness_fast(
+#                 K_manifold,
+#                 trace_low_frac=1e-3,    # tune to your problem
+#                 trace_high_frac=0.98,
+#                 var_eps=1e-8,
+#                 diag_offdiag_ratio_min=0.05,
+#                 diag_offdiag_ratio_max=20.0,
+#                 rowstd_eps=1e-4,
+#                 use_power_iter=False,   # keep cheap; set True if you want slightly stronger check
+#                 verbose=False
+#             )
+
+#             if kept_mask.sum().item() > self.num_heat_time / 2:
+#                 # fall back: recompute heat_times (call your preprocessing) or relax thresholds
+#                 print("Warning: More than half of heat kernels flagged degenerate. Recomputing heat times.")
+#                 print("Previous heat times:", self.heat_times)
+#                 with torch.no_grad():
+#                     self.heat_times, diag = compute_heat_time_scale_from_laplacian(L=L_manifold, num_times=self.num_heat_time, 
+#                                                                                    retain_high_freq_threshold=self.retain_high_freq_threshold, 
+#                                                                                    suppress_low_freq_threshold = self.suppress_low_freq_threshold)
+#                     print("Selected heat times:", self.heat_times)
+#                     self.K_graph = compute_heat_kernel_from_laplacian(self.L_graph, self.heat_times)
+#                 K_manifold = compute_heat_kernel_from_laplacian(L_manifold, self.heat_times)
+#                 self.freeze_sigma = 0
+
+#         divergence = compute_heat_kernel_divergence(K_manifold, self.K_graph)
+        
+#         with torch.no_grad():
+#             L_manifold_reference = compute_manifold_laplacian(distances=distances,
+#                                                               sigma=self.first_sigma,
+#                                                               laplacian_regularization=self.laplacian_regularization,
+#                                                               debug=False)
+#             K_manifold_reference = compute_heat_kernel_from_laplacian(L_manifold_reference, self.heat_times)
+
+#             divergence_reference = compute_heat_kernel_divergence(K_manifold_reference, self.K_graph)
+        
+#         if self.dist_distorsion_penalty > 0:
+#             dist_div = (distances.mean() - self.mean_distance)**2
+#             print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f} - Distance deviation loss: {(dist_div.item()):.6f}")
+#             return {'final_loss': divergence + self.dist_distorsion_penalty * dist_div, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema, "dist_loss": dist_div}
+        
+#         print(f"Current Laplacian loss: {(divergence.item()):.6f} - With referent sigma: {(divergence_reference.item()):.6f}")
+#         return {'final_loss': divergence, 'dyn_loss': divergence, 'ref_loss': divergence_reference, 'sigma': self.sigma_ema}
 
 
 
