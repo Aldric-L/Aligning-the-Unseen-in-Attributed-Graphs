@@ -1003,7 +1003,7 @@ class ManifoldHeatKernelDecoder(DecoderBase):
                 self.model().get_latent_manifold()._clamp_point_to_bounds(z),
                 weight_type="geodesic",  
                 max_grid_neighbors=8,     # Connect to up to 8 nearest grid nodes
-                num_threads=6
+                num_threads=None
             )
         else:
             distances = torch.zeros(num_nodes, num_nodes, device=z.device)

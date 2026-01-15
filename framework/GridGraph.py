@@ -297,6 +297,8 @@ class GridGraph:
           - pathfinding_workers: number of processes to use for the precomputation (defaults to num_threads)
           - use_process_for_pathfinding: if True, use ProcessPoolExecutor for the Dijkstra stage (bypass GIL)
         """
+        if num_threads is None or num_threads <= 0:
+            num_threads = max(torch.get_num_threads()-2,1)
         query_points = query_points.to(self.device).float()
         n_query = query_points.shape[0]
 
@@ -625,6 +627,8 @@ class GridGraph:
 
         prefer_processes = bool(use_processes) and (not running_in_ipython)
 
+        if workers <= 0 or workers is None:
+            workers = max(torch.get_num_threads()-2,1)
         max_workers = min(workers, max(1, len(query_nodes)))
 
         # Helper to run via executor and collect results with tqdm
