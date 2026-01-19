@@ -1,5 +1,6 @@
 
 import torch
+import torch.multiprocessing as mp
 from torch_geometric.data import Data
 from torch_geometric.utils import dense_to_sparse
 from typing import Optional, Tuple, List, Union, Dict, Any
@@ -10,6 +11,7 @@ import heapq
 import math
 import traceback
 import sys
+import psutil
 
 import heapq
 def dijkstra_worker(adjacency, source, targets):
@@ -64,6 +66,84 @@ def dijkstra_worker(adjacency, source, targets):
             results[t] = None
     return results
 
+def _dijkstra_worker_tensor(row_ptr, col_ind, weights, source, targets):
+    """
+    Optimized Dijkstra worker using PyTorch Shared Tensors (CSR format).
+    Args:
+        row_ptr, col_ind, weights: Shared PyTorch tensors (Graph).
+        source: int (Start Node)
+        targets: set/list of ints (Target Nodes)
+    """
+    # 1. Zero-Copy: View tensors as Numpy arrays for faster scalar iteration
+    #    (Numpy scalar access is much faster than PyTorch scalar access)
+    row_ptr_np = row_ptr.numpy()
+    col_ind_np = col_ind.numpy()
+    weights_np = weights.numpy()
+
+    # 2. Algorithm Setup
+    dist = {source: 0.0}
+    heap = [(0.0, source)]
+    visited = set()
+    
+    # Convert targets to set for O(1) lookup, track remaining
+    targets_remaining = set(targets)
+    results = {}
+    prev = {} # Path reconstruction map
+
+    while heap and targets_remaining:
+        d_u, u = heapq.heappop(heap)
+
+        if u in visited:
+            continue
+        visited.add(u)
+
+        if d_u > dist.get(u, float('inf')):
+            continue
+
+        # Target Check
+        if u in targets_remaining:
+            # Reconstruct Path
+            path = []
+            cur = u
+            while True:
+                path.append(cur)
+                if cur == source:
+                    break
+                if cur not in prev:
+                    break # Should not happen if logic is correct
+                cur = prev[cur]
+            path.reverse()
+            
+            results[u] = path
+            targets_remaining.remove(u)
+            if not targets_remaining:
+                break
+
+        # 3. Fast CSR Neighbor Lookup
+        # Corresponds to: for v, w in adjacency[u]:
+        start_ix = row_ptr_np[u]
+        end_ix = row_ptr_np[u+1]
+        
+        # Slicing numpy arrays is highly efficient
+        neighbors = col_ind_np[start_ix:end_ix]
+        edge_weights = weights_np[start_ix:end_ix]
+
+        for i in range(len(neighbors)):
+            v = neighbors[i]
+            w = edge_weights[i]
+            
+            nd = d_u + w
+            if nd < dist.get(v, float('inf')):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(heap, (nd, v))
+
+    # Fill missing targets
+    for t in targets:
+        if t not in results:
+            results[t] = None
+            
+    return results
 
 class GridGraph:
     """
@@ -600,93 +680,220 @@ class GridGraph:
                 results[t] = None
         return results
 
-    def _find_shortest_paths_parallel(self, graph_info: Dict[str, Any], n_query: int,
-                                  workers: int = 4, use_processes: bool = True) -> Dict[tuple, List[int]]:
-        """
-        Robust parallel single-source Dijkstra. Tries to use ProcessPoolExecutor (no GIL),
-        but falls back to ThreadPoolExecutor on environments where process workers cannot
-        import the worker function (e.g. notebooks / __main__ pickling issue), or if any
-        process-level errors occur.
+    # def _find_shortest_paths_parallel(self, graph_info: Dict[str, Any], n_query: int,
+    #                               workers: int = 4, use_processes: bool = True) -> Dict[tuple, List[int]]:
+    #     """
+    #     Robust parallel single-source Dijkstra. Tries to use ProcessPoolExecutor (no GIL),
+    #     but falls back to ThreadPoolExecutor on environments where process workers cannot
+    #     import the worker function (e.g. notebooks / __main__ pickling issue), or if any
+    #     process-level errors occur.
 
-        Returns: paths dict mapping (i, j) -> path (list) or None.
+    #     Returns: paths dict mapping (i, j) -> path (list) or None.
+    #     """
+    #     adjacency = graph_info['adjacency']
+    #     qstart = graph_info['query_node_start']
+    #     query_nodes = [qstart + i for i in range(n_query)]
+    #     target_sets = [set(query_nodes) - {qn} for qn in query_nodes]
+
+    #     paths: Dict[tuple, List[int]] = {}
+
+    #     # Detect interactive / notebook environments where ProcessPool often fails to import __main__:
+    #     running_in_ipython = False
+    #     try:
+    #         # get_ipython exists in IPython/Jupyter kernels
+    #         running_in_ipython = 'get_ipython' in globals() or ('IPython' in sys.modules and hasattr(sys.modules['IPython'], 'get_ipython') and sys.modules['IPython'].get_ipython() is not None)
+    #     except Exception:
+    #         running_in_ipython = False
+
+    #     prefer_processes = bool(use_processes) and (not running_in_ipython)
+
+    #     if workers <= 0 or workers is None:
+    #         workers = max(torch.get_num_threads()-2,1)
+    #     max_workers = min(workers, max(1, len(query_nodes)))
+
+    #     # Helper to run via executor and collect results with tqdm
+    #     def run_with_executor(executor, worker_fn, exec_name="executor"):
+    #         futures_map = {}
+    #         for i, (src, tgt_set) in enumerate(zip(query_nodes, target_sets)):
+    #             # submit (worker_fn, adjacency, src, tgt_set)
+    #             futures_map[executor.submit(worker_fn, adjacency, src, tgt_set)] = (i, src)
+    #         with tqdm(total=len(futures_map), desc=f"Pathfinding ({exec_name})", dynamic_ncols=True) as pbar:
+    #             for fut in as_completed(list(futures_map.keys())):
+    #                 idx, src = futures_map[fut]
+    #                 try:
+    #                     res = fut.result()
+    #                 except Exception as exc:
+    #                     # catch worker failure (including pickling / process death)
+    #                     print(f"Pathfinding worker failed for source {src}: {exc}")
+    #                     # show a short traceback for debugging (but don't crash)
+    #                     tb = traceback.format_exc()
+    #                     print(tb)
+    #                     res = {t: None for t in target_sets[idx]}
+    #                 i_src = src - qstart
+    #                 for target_node, path in res.items():
+    #                     j_tgt = target_node - qstart
+    #                     if path is None:
+    #                         paths[(i_src, j_tgt)] = None
+    #                     else:
+    #                         paths[(i_src, j_tgt)] = path
+    #                 pbar.update(1)
+
+    #     # 1) Try ProcessPoolExecutor if it's reasonable
+    #     if prefer_processes:
+    #         try:
+    #             with ProcessPoolExecutor(max_workers=max_workers) as ex:
+    #                 # Use top-level function dijkstra_worker (must be importable)
+    #                 run_with_executor(ex, dijkstra_worker, exec_name="parallel Dijkstra (processes)")
+    #             # success; ensure diagonal entries
+    #             for i in range(n_query):
+    #                 paths[(i, i)] = [qstart + i]
+    #             return paths
+
+    #         except Exception as e:
+    #             # If process spawning / pickling fails -> fall back to threads
+    #             print("Process-based pathfinding failed or raised during startup:")
+    #             print(f"  {type(e).__name__}: {e}")
+    #             # If the specific error mentions missing attribute in __main__, give a hint
+    #             msg = str(e)
+    #             if "Can't get attribute 'dijkstra_worker'" in msg or "can't get attribute" in msg or running_in_ipython:
+    #                 print("This environment cannot reliably spawn worker processes for top-level functions "
+    #                     "(common in notebooks or interactive shells). Falling back to threaded execution.")
+    #             else:
+    #                 print("Falling back to threaded execution. If you run this script from a file (python script.py), "
+    #                     "process-based execution may be faster.")
+    #             # fall-through to threaded executor below
+
+    #     # 2) Threaded fallback (safe in all environments, but subject to GIL)
+    #     with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    #         run_with_executor(ex, self._dijkstra_single_source, exec_name="threaded Dijkstra")
+    #     # ensure diagonal entries
+    #     for i in range(n_query):
+    #         paths[(i, i)] = [qstart + i]
+
+    #     return paths
+
+    def _find_shortest_paths_parallel(self, graph_info: Dict[str, Any], n_query: int,
+                                      workers: int = 4, use_processes: bool = True) -> Dict[tuple, List[int]]:
+        """
+        Robust parallel single-source Dijkstra using PyTorch Multiprocessing (Shared Memory).
+        Automatically converts Dict graph to Shared CSR Tensors for process workers,
+        avoiding pickling overhead. Falls back to Threading if processes fail.
         """
         adjacency = graph_info['adjacency']
         qstart = graph_info['query_node_start']
         query_nodes = [qstart + i for i in range(n_query)]
         target_sets = [set(query_nodes) - {qn} for qn in query_nodes]
-
         paths: Dict[tuple, List[int]] = {}
 
-        # Detect interactive / notebook environments where ProcessPool often fails to import __main__:
+        # 1. Determine Environment & Worker Count
         running_in_ipython = False
         try:
-            # get_ipython exists in IPython/Jupyter kernels
-            running_in_ipython = 'get_ipython' in globals() or ('IPython' in sys.modules and hasattr(sys.modules['IPython'], 'get_ipython') and sys.modules['IPython'].get_ipython() is not None)
+            running_in_ipython = 'get_ipython' in globals() or \
+                                 ('IPython' in sys.modules and sys.modules['IPython'].get_ipython() is not None)
         except Exception:
-            running_in_ipython = False
+            pass
 
+        # We prefer processes, but avoid them in interactive notebooks unless explicitly forced
         prefer_processes = bool(use_processes) and (not running_in_ipython)
 
         if workers <= 0 or workers is None:
-            workers = max(torch.get_num_threads()-2,1)
+            # Leave some cores for the OS/Main process
+            workers = max(mp.cpu_count() - 2, 1)
         max_workers = min(workers, max(1, len(query_nodes)))
 
-        # Helper to run via executor and collect results with tqdm
-        def run_with_executor(executor, worker_fn, exec_name="executor"):
+        # 2. Generic Executor Helper
+        def run_with_executor(executor, worker_fn, fixed_args, exec_name):
+            """
+            fixed_args: tuple of arguments that are CONSTANT across all tasks 
+                        (e.g., the graph tensors OR the adjacency dict)
+            """
             futures_map = {}
             for i, (src, tgt_set) in enumerate(zip(query_nodes, target_sets)):
-                # submit (worker_fn, adjacency, src, tgt_set)
-                futures_map[executor.submit(worker_fn, adjacency, src, tgt_set)] = (i, src)
+                # Submit: worker(fixed_arg1, fixed_arg2, ..., src, tgt_set)
+                futures_map[executor.submit(worker_fn, *fixed_args, src, tgt_set)] = (i, src)
+
             with tqdm(total=len(futures_map), desc=f"Pathfinding ({exec_name})", dynamic_ncols=True) as pbar:
                 for fut in as_completed(list(futures_map.keys())):
                     idx, src = futures_map[fut]
                     try:
                         res = fut.result()
                     except Exception as exc:
-                        # catch worker failure (including pickling / process death)
-                        print(f"Pathfinding worker failed for source {src}: {exc}")
-                        # show a short traceback for debugging (but don't crash)
-                        tb = traceback.format_exc()
-                        print(tb)
+                        print(f"Worker failed for source {src}: {exc}")
+                        # traceback.print_exc() # Uncomment for deep debugging
                         res = {t: None for t in target_sets[idx]}
+                    
+                    # Store results
                     i_src = src - qstart
                     for target_node, path in res.items():
                         j_tgt = target_node - qstart
-                        if path is None:
-                            paths[(i_src, j_tgt)] = None
-                        else:
-                            paths[(i_src, j_tgt)] = path
+                        paths[(i_src, j_tgt)] = path
                     pbar.update(1)
 
-        # 1) Try ProcessPoolExecutor if it's reasonable
+        # ---------------------------------------------------------
+        # OPTION A: PyTorch Multiprocessing (Shared Memory)
+        # ---------------------------------------------------------
         if prefer_processes:
             try:
-                with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                    # Use top-level function dijkstra_worker (must be importable)
-                    run_with_executor(ex, dijkstra_worker, exec_name="parallel Dijkstra (processes)")
-                # success; ensure diagonal entries
+                # Determine graph size
+                max_node_id = max(adjacency.keys()) if adjacency else 0
+                # Flatten Dict -> List for Tensor creation
+                # (Optimization: In a real library, cache this or pass it in pre-converted)
+                row_ptr = [0]
+                col_ind = []
+                weights = []
+                cumulative = 0
+                
+                # Assuming continuous nodes 0..max_node_id for CSR efficiency
+                # If nodes are sparse/non-contiguous, this list might be large but sparse.
+                for u in range(max_node_id + 1):
+                    edges = adjacency.get(u, [])
+                    cumulative += len(edges)
+                    row_ptr.append(cumulative)
+                    for v, w in edges:
+                        col_ind.append(v)
+                        weights.append(float(w))
+
+                # Create Tensors
+                t_row = torch.tensor(row_ptr, dtype=torch.int64)
+                t_col = torch.tensor(col_ind, dtype=torch.int64)
+                t_val = torch.tensor(weights, dtype=torch.float32)
+
+                # SHARE MEMORY: This is the key. Zero-copy for workers.
+                t_row.share_memory_()
+                t_col.share_memory_()
+                t_val.share_memory_()
+
+                # Use 'spawn' context for PyTorch safety
+                mp_context = mp.get_context('spawn')
+
+                with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as ex:
+                    # Pass TENSORS to the worker (they are shared handles now)
+                    # Worker signature: (row, col, val, src, targets)
+                    run_with_executor(ex, _dijkstra_worker_tensor, 
+                                      fixed_args=(t_row, t_col, t_val), 
+                                      exec_name="PyTorch MP Dijkstra")
+                
+                # Fill diagonals and return
                 for i in range(n_query):
                     paths[(i, i)] = [qstart + i]
                 return paths
 
             except Exception as e:
-                # If process spawning / pickling fails -> fall back to threads
-                print("Process-based pathfinding failed or raised during startup:")
-                print(f"  {type(e).__name__}: {e}")
-                # If the specific error mentions missing attribute in __main__, give a hint
-                msg = str(e)
-                if "Can't get attribute 'dijkstra_worker'" in msg or "can't get attribute" in msg or running_in_ipython:
-                    print("This environment cannot reliably spawn worker processes for top-level functions "
-                        "(common in notebooks or interactive shells). Falling back to threaded execution.")
-                else:
-                    print("Falling back to threaded execution. If you run this script from a file (python script.py), "
-                        "process-based execution may be faster.")
-                # fall-through to threaded executor below
+                print(f"\n[Warning] Process-based execution failed: {e}")
+                print("Falling back to Threaded execution (slower due to GIL, but safe).")
+                # Fall through to Option B
 
-        # 2) Threaded fallback (safe in all environments, but subject to GIL)
+        # ---------------------------------------------------------
+        # OPTION B: Threading Fallback (Original Logic)
+        # ---------------------------------------------------------
+        # Use the class method or original dict-based worker
+        # Note: self._dijkstra_single_source must accept (adjacency, src, targets)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            run_with_executor(ex, self._dijkstra_single_source, exec_name="threaded Dijkstra")
-        # ensure diagonal entries
+            run_with_executor(ex, self._dijkstra_single_source, 
+                              fixed_args=(adjacency,), 
+                              exec_name="Threaded Dijkstra")
+
+        # Fill diagonals
         for i in range(n_query):
             paths[(i, i)] = [qstart + i]
 
@@ -696,163 +903,313 @@ class GridGraph:
     ####################################################################
     # recompute distances (must preserve gradients) - improved chunking and tqdm
     ####################################################################
+    # def _recompute_path_distances_multithreaded(self,
+    #                                        paths: dict,
+    #                                        graph_info: dict,
+    #                                        query_points: torch.Tensor,
+    #                                        weight_type: str,
+    #                                        n_query: int,
+    #                                        num_threads: int) -> torch.Tensor:
+    #     """
+    #     Memory-efficient, batched recomputation of path distances with autograd support.
+
+    #     Replaces previous thread/future approach. Processes (i,j) pairs in chunks,
+    #     builds all edges for a chunk, computes all their weights in a batch (vectorized),
+    #     then scatter-adds per-path sums back into the distance matrix.
+
+    #     - paths: dict[(i,j)] -> list of node indices (global indices, includes grid + query nodes) or None
+    #     - graph_info['query_node_start'] gives offset where query nodes begin
+    #     - num_threads argument retained for API but not used for concurrency here (we run in-process).
+    #     """
+    #     device = self.device
+    #     query_start = graph_info['query_node_start']
+
+    #     # allocate distance matrix (float, on device)
+    #     distance_matrix = torch.full((n_query, n_query), float('inf'), device=device)
+
+    #     # Build list of unique upper-triangle pairs (i<=j) to exploit symmetry and avoid double work
+    #     pairs = [(i, j) for i in range(n_query) for j in range(i, n_query)]
+    #     if len(pairs) == 0:
+    #         return distance_matrix
+        
+    #     total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    #     # If extremely many pairs, choose a conservative chunk size; you can tune this.
+    #     # This parameter bounds how many (i,j) pairs we accumulate before vectorizing their edges.
+    #     if total_ram_gb < 128:
+    #         max_pairs_per_chunk = 64  # default, lower => lower mem usage; raise for speed if you have RAM/GPU mem.
+    #     else: 
+    #         max_pairs_per_chunk = int(max(12 * (total_ram_gb**0.5), 64))
+
+    #     # 3. Calculate number of chunks
+    #     n_pairs = len(pairs)
+
+    #     # We wrap the calculation in int() just to be safe
+    #     n_chunks = int((n_pairs + max_pairs_per_chunk - 1) // max_pairs_per_chunk)
+
+    #     # tqdm over chunks (this produces a visible progress bar)
+    #     chunk_iter = (pairs[k*max_pairs_per_chunk:(k+1)*max_pairs_per_chunk] for k in range(n_chunks))
+    #     with tqdm(total=n_pairs, desc="Recomputing distances (batched)", dynamic_ncols=True) as pbar:
+    #         for chunk_pairs in chunk_iter:
+    #             # For this chunk we will collect all edges for all paths in chunk
+    #             edges_u = []
+    #             edges_v = []
+    #             edge_pair_idx = []  # for each edge, which pair index in chunk it belongs to
+    #             pair_indices = []   # map local pair index -> global (i,j)
+
+    #             for local_idx, (i, j) in enumerate(chunk_pairs):
+    #                 pair_indices.append((i, j))
+    #                 path = paths.get((i, j), None)
+    #                 if path is None:
+    #                     # mark as infinite (we'll skip edges assembly)
+    #                     continue
+    #                 # If self-path, zero and continue
+    #                 if len(path) <= 1:
+    #                     continue
+    #                 # collect edges along path in order
+    #                 for k in range(len(path) - 1):
+    #                     u = int(path[k])
+    #                     v = int(path[k+1])
+    #                     edges_u.append(u)
+    #                     edges_v.append(v)
+    #                     edge_pair_idx.append(local_idx)
+
+    #             if len(edges_u) == 0:
+    #                 # nothing computed in this chunk; set diag zeros and update progress
+    #                 for local_idx, (i, j) in enumerate(chunk_pairs):
+    #                     if i == j:
+    #                         distance_matrix[i, j] = 0.0
+    #                 pbar.update(len(chunk_pairs))
+    #                 continue
+
+    #             # convert to tensors on device
+    #             edges_u = torch.tensor(edges_u, dtype=torch.long, device=device)
+    #             edges_v = torch.tensor(edges_v, dtype=torch.long, device=device)
+    #             edge_pair_idx = torch.tensor(edge_pair_idx, dtype=torch.long, device=device)  # shape (E_chunk,)
+
+    #             # Gather positions for each edge endpoint (batched). Preserve grad for query points.
+    #             # If node index >= query_start -> from query_points (which may require grad)
+    #             # else from self.node_positions (constants)
+    #             def gather_pos(idx_tensor):
+    #                 # idx_tensor is (E_chunk,) long, values in 0..(num_nodes + n_query - 1)
+    #                 # we pick positions elementwise
+    #                 # boolean mask for query nodes
+    #                 is_query = idx_tensor >= query_start
+    #                 pos_list = []
+    #                 if is_query.any():
+    #                     # query indices (relative)
+    #                     q_idx = (idx_tensor[is_query] - query_start).long()
+    #                     pos_q = query_points[q_idx]  # (n_q_selected, D) - keeps grad if query_points require grad
+    #                 else:
+    #                     pos_q = None
+    #                 if (~is_query).any():
+    #                     g_idx = idx_tensor[~is_query].long()
+    #                     pos_g = self.node_positions[g_idx]  # constants
+    #                 else:
+    #                     pos_g = None
+
+    #                 # Now we need to reconstruct positions in the original order.
+    #                 # Create an empty tensor and scatter into it.
+    #                 D = self.node_positions.shape[1]
+    #                 pos = torch.empty((idx_tensor.shape[0], D), device=device, dtype=self.node_positions.dtype)
+    #                 if pos_q is not None:
+    #                     pos[is_query] = pos_q
+    #                 if pos_g is not None:
+    #                     pos[~is_query] = pos_g
+    #                 return pos
+
+    #             pos_u = gather_pos(edges_u)  # (E_chunk, D)
+    #             pos_v = gather_pos(edges_v)  # (E_chunk, D)
+    #             dx = pos_v - pos_u  # (E_chunk, D)
+
+    #             # Compute weights in batch
+    #             if weight_type == "geodesic":
+    #                 # metric_tensor should accept (E_chunk, D) -> (E_chunk, D, D)
+    #                 g_u = self.manifold.metric_tensor(pos_u)
+    #                 g_v = self.manifold.metric_tensor(pos_v)
+    #                 g_avg = (g_u + g_v) * 0.5
+    #                 # quadratic forms: (E,1,1) -> squeeze to (E,)
+    #                 qf = torch.bmm(torch.bmm(dx.unsqueeze(1), g_avg), dx.unsqueeze(2)).squeeze()
+    #                 qf = torch.clamp(qf, min=1e-12)
+    #                 weights = torch.sqrt(qf)
+    #             elif weight_type == "euclidean":
+    #                 weights = torch.norm(dx, dim=1)
+    #             else:  # unit
+    #                 weights = torch.ones((dx.shape[0],), device=device, dtype=dx.dtype)
+
+    #             # Sum edge weights per pair using scatter_add
+    #             n_local_pairs = len(chunk_pairs)
+    #             totals = torch.zeros((n_local_pairs,), device=device, dtype=weights.dtype)
+    #             totals = totals.scatter_add(0, edge_pair_idx, weights)
+
+    #             # Assign totals to distance matrix for each pair (and symmetric counterpart)
+    #             for local_idx, (i, j) in enumerate(chunk_pairs):
+    #                 # if path is None -> infinite; if i==j -> zero
+    #                 path = paths.get((i, j), None)
+    #                 if path is None:
+    #                     distance_matrix[i, j] = float('inf')
+    #                     distance_matrix[j, i] = float('inf')
+    #                 elif i == j:
+    #                     distance_matrix[i, j] = 0.0
+    #                 else:
+    #                     # totals[local_idx] contains sum for this pair (could be zero if path length 0)
+    #                     val = totals[local_idx]
+    #                     distance_matrix[i, j] = val
+    #                     distance_matrix[j, i] = val
+
+    #             # free big temporaries as soon as possible
+    #             del edges_u, edges_v, edge_pair_idx, pos_u, pos_v, dx, weights, totals, g_u, g_v, g_avg
+    #             if torch.cuda.is_available():
+    #                 # free any cached memory (helpful for long runs)
+    #                 torch.cuda.empty_cache()
+
+    #             pbar.update(len(chunk_pairs))
+
+    #     return distance_matrix
+
     def _recompute_path_distances_multithreaded(self,
-                                           paths: dict,
-                                           graph_info: dict,
-                                           query_points: torch.Tensor,
-                                           weight_type: str,
-                                           n_query: int,
-                                           num_threads: int) -> torch.Tensor:
+                                               paths: dict,
+                                               graph_info: dict,
+                                               query_points: torch.Tensor,
+                                               weight_type: str,
+                                               n_query: int,
+                                               num_threads: int) -> torch.Tensor:
         """
-        Memory-efficient, batched recomputation of path distances with autograd support.
-
-        Replaces previous thread/future approach. Processes (i,j) pairs in chunks,
-        builds all edges for a chunk, computes all their weights in a batch (vectorized),
-        then scatter-adds per-path sums back into the distance matrix.
-
-        - paths: dict[(i,j)] -> list of node indices (global indices, includes grid + query nodes) or None
-        - graph_info['query_node_start'] gives offset where query nodes begin
-        - num_threads argument retained for API but not used for concurrency here (we run in-process).
-        """
+        Optimized implementation with smart chunking strategies:
+        1. Cluster Mode (High RAM + CPU): Disables chunking for max speed.
+        2. GPU/Low RAM Mode: Uses memory-safe chunking.
+        3. Vectorized Logic: Removes Python loops over path nodes.
+        """        
         device = self.device
         query_start = graph_info['query_node_start']
+        
+        # --- 0. Determine Chunking Strategy ---
+        # Build pairs first to know total size
+        pairs = [(i, j) for i in range(n_query) for j in range(i, n_query)]
+        n_pairs = len(pairs)
+        
+        if n_pairs == 0:
+            return torch.full((n_query, n_query), float('inf'), device=device)
 
-        # allocate distance matrix (float, on device)
+        total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        has_cuda = torch.cuda.is_available()
+
+        # CLUSTER CHECK: If massive RAM and NO CUDA, disable chunking entirely.
+        # CPU RAM is fast enough to hold the whole problem; overhead of chunks > benefit.
+        if total_ram_gb > 128 and not has_cuda:
+            max_pairs_per_chunk = n_pairs  # Process everything in one go
+        else:
+            # Fallback / GPU Logic: Adjust chunk size based on RAM/VRAM constraints
+            if total_ram_gb < 128:
+                max_pairs_per_chunk = 64
+            else:
+                max_pairs_per_chunk = int(max(50 * (total_ram_gb**0.5), 128))
+
+        # Calculate chunks (If max_pairs_per_chunk == n_pairs, this results in 1 chunk)
+        n_chunks = (n_pairs + max_pairs_per_chunk - 1) // max_pairs_per_chunk
+        chunk_iter = (pairs[k*max_pairs_per_chunk : (k+1)*max_pairs_per_chunk] for k in range(n_chunks))
+
+        # --- 1. OPTIMIZATION: Combine Static and Query positions ---
+        # This allows simple indexing: all_positions[index] without if/else logic inside the loop.
+        if query_start == self.node_positions.shape[0]:
+            all_positions = torch.cat([self.node_positions, query_points], dim=0)
+        else:
+            total_size = max(self.node_positions.shape[0], query_start + n_query)
+            all_positions = torch.empty((total_size, self.node_positions.shape[1]), 
+                                        dtype=self.node_positions.dtype, device=device)
+            all_positions[:self.node_positions.shape[0]] = self.node_positions
+            indices = torch.arange(n_query, device=device) + query_start
+            all_positions.index_put_((indices,), query_points)
+
+        # Allocate distance matrix
         distance_matrix = torch.full((n_query, n_query), float('inf'), device=device)
 
-        # Build list of unique upper-triangle pairs (i<=j) to exploit symmetry and avoid double work
-        pairs = [(i, j) for i in range(n_query) for j in range(i, n_query)]
-        if len(pairs) == 0:
-            return distance_matrix
-
-        # If extremely many pairs, choose a conservative chunk size; you can tune this.
-        # This parameter bounds how many (i,j) pairs we accumulate before vectorizing their edges.
-        max_pairs_per_chunk = 64  # default, lower => lower mem usage; raise for speed if you have RAM/GPU mem.
-
-        # You can make chunk size adapt to graph size: smaller when many pairs
-        # For bigger problems reduce this number.
-        n_pairs = len(pairs)
-        n_chunks = (n_pairs + max_pairs_per_chunk - 1) // max_pairs_per_chunk
-
-        # tqdm over chunks (this produces a visible progress bar)
-        chunk_iter = (pairs[k*max_pairs_per_chunk:(k+1)*max_pairs_per_chunk] for k in range(n_chunks))
-        with tqdm(total=n_pairs, desc="Recomputing distances (batched)", dynamic_ncols=True) as pbar:
+        # --- 2. Processing Loop ---
+        with tqdm(total=n_pairs, desc="Recomputing distances", dynamic_ncols=True) as pbar:
             for chunk_pairs in chunk_iter:
-                # For this chunk we will collect all edges for all paths in chunk
-                edges_u = []
-                edges_v = []
-                edge_pair_idx = []  # for each edge, which pair index in chunk it belongs to
-                pair_indices = []   # map local pair index -> global (i,j)
+                edges_u_list = []
+                edges_v_list = []
+                path_lengths_for_index = [] 
+                valid_indices = []
 
+                # OPTIMIZATION: Fast Python List Flattening
                 for local_idx, (i, j) in enumerate(chunk_pairs):
-                    pair_indices.append((i, j))
-                    path = paths.get((i, j), None)
-                    if path is None:
-                        # mark as infinite (we'll skip edges assembly)
+                    path = paths.get((i, j))
+                    
+                    if path is None or len(path) <= 1:
+                        if i == j: distance_matrix[i, j] = 0.0
                         continue
-                    # If self-path, zero and continue
-                    if len(path) <= 1:
-                        continue
-                    # collect edges along path in order
-                    for k in range(len(path) - 1):
-                        u = int(path[k])
-                        v = int(path[k+1])
-                        edges_u.append(u)
-                        edges_v.append(v)
-                        edge_pair_idx.append(local_idx)
+                        
+                    # Fast Slicing (C-speed)
+                    edges_u_list.extend(path[:-1])
+                    edges_v_list.extend(path[1:])
+                    
+                    path_lengths_for_index.append(len(path) - 1)
+                    valid_indices.append(local_idx)
 
-                if len(edges_u) == 0:
-                    # nothing computed in this chunk; set diag zeros and update progress
-                    for local_idx, (i, j) in enumerate(chunk_pairs):
-                        if i == j:
-                            distance_matrix[i, j] = 0.0
+                if not edges_u_list:
                     pbar.update(len(chunk_pairs))
                     continue
 
-                # convert to tensors on device
-                edges_u = torch.tensor(edges_u, dtype=torch.long, device=device)
-                edges_v = torch.tensor(edges_v, dtype=torch.long, device=device)
-                edge_pair_idx = torch.tensor(edge_pair_idx, dtype=torch.long, device=device)  # shape (E_chunk,)
+                # Create Tensors
+                t_u = torch.tensor(edges_u_list, dtype=torch.long, device=device)
+                t_v = torch.tensor(edges_v_list, dtype=torch.long, device=device)
 
-                # Gather positions for each edge endpoint (batched). Preserve grad for query points.
-                # If node index >= query_start -> from query_points (which may require grad)
-                # else from self.node_positions (constants)
-                def gather_pos(idx_tensor):
-                    # idx_tensor is (E_chunk,) long, values in 0..(num_nodes + n_query - 1)
-                    # we pick positions elementwise
-                    # boolean mask for query nodes
-                    is_query = idx_tensor >= query_start
-                    pos_list = []
-                    if is_query.any():
-                        # query indices (relative)
-                        q_idx = (idx_tensor[is_query] - query_start).long()
-                        pos_q = query_points[q_idx]  # (n_q_selected, D) - keeps grad if query_points require grad
-                    else:
-                        pos_q = None
-                    if (~is_query).any():
-                        g_idx = idx_tensor[~is_query].long()
-                        pos_g = self.node_positions[g_idx]  # constants
-                    else:
-                        pos_g = None
+                # Vectorized Index Generation
+                t_counts = torch.tensor(path_lengths_for_index, device=device, dtype=torch.long)
+                t_indices = torch.tensor(valid_indices, device=device, dtype=torch.long)
+                edge_pair_idx = torch.repeat_interleave(t_indices, t_counts)
 
-                    # Now we need to reconstruct positions in the original order.
-                    # Create an empty tensor and scatter into it.
-                    D = self.node_positions.shape[1]
-                    pos = torch.empty((idx_tensor.shape[0], D), device=device, dtype=self.node_positions.dtype)
-                    if pos_q is not None:
-                        pos[is_query] = pos_q
-                    if pos_g is not None:
-                        pos[~is_query] = pos_g
-                    return pos
+                # Compute Weights
+                pos_u = all_positions[t_u]
+                pos_v = all_positions[t_v]
+                dx = pos_v - pos_u
 
-                pos_u = gather_pos(edges_u)  # (E_chunk, D)
-                pos_v = gather_pos(edges_v)  # (E_chunk, D)
-                dx = pos_v - pos_u  # (E_chunk, D)
-
-                # Compute weights in batch
                 if weight_type == "geodesic":
-                    # metric_tensor should accept (E_chunk, D) -> (E_chunk, D, D)
                     g_u = self.manifold.metric_tensor(pos_u)
                     g_v = self.manifold.metric_tensor(pos_v)
                     g_avg = (g_u + g_v) * 0.5
-                    # quadratic forms: (E,1,1) -> squeeze to (E,)
                     qf = torch.bmm(torch.bmm(dx.unsqueeze(1), g_avg), dx.unsqueeze(2)).squeeze()
                     qf = torch.clamp(qf, min=1e-12)
                     weights = torch.sqrt(qf)
                 elif weight_type == "euclidean":
                     weights = torch.norm(dx, dim=1)
-                else:  # unit
-                    weights = torch.ones((dx.shape[0],), device=device, dtype=dx.dtype)
+                else:
+                    weights = torch.ones_like(t_u, dtype=pos_u.dtype)
 
-                # Sum edge weights per pair using scatter_add
-                n_local_pairs = len(chunk_pairs)
-                totals = torch.zeros((n_local_pairs,), device=device, dtype=weights.dtype)
-                totals = totals.scatter_add(0, edge_pair_idx, weights)
+                # Scatter Add
+                n_local = len(chunk_pairs)
+                totals = torch.zeros(n_local, device=device, dtype=weights.dtype)
+                totals.index_add_(0, edge_pair_idx, weights)
 
-                # Assign totals to distance matrix for each pair (and symmetric counterpart)
-                for local_idx, (i, j) in enumerate(chunk_pairs):
-                    # if path is None -> infinite; if i==j -> zero
-                    path = paths.get((i, j), None)
-                    if path is None:
-                        distance_matrix[i, j] = float('inf')
-                        distance_matrix[j, i] = float('inf')
-                    elif i == j:
-                        distance_matrix[i, j] = 0.0
-                    else:
-                        # totals[local_idx] contains sum for this pair (could be zero if path length 0)
-                        val = totals[local_idx]
-                        distance_matrix[i, j] = val
-                        distance_matrix[j, i] = val
+                # Write back to matrix
+                valid_indices_cpu = valid_indices
+                computed_sums = totals[t_indices]
 
-                # free big temporaries as soon as possible
-                del edges_u, edges_v, edge_pair_idx, pos_u, pos_v, dx, weights, totals, g_u, g_v, g_avg
-                if torch.cuda.is_available():
-                    # free any cached memory (helpful for long runs)
-                    torch.cuda.empty_cache()
+                row_indices = []
+                col_indices = []
+                
+                for k_idx, local_idx in enumerate(valid_indices_cpu):
+                    i, j = chunk_pairs[local_idx]
+                    row_indices.append(i)
+                    col_indices.append(j)
+                
+                if row_indices:
+                    rows = torch.tensor(row_indices, device=device)
+                    cols = torch.tensor(col_indices, device=device)
+                    distance_matrix.index_put_((rows, cols), computed_sums)
+                    distance_matrix.index_put_((cols, rows), computed_sums)
 
+                # Cleanup
+                del t_u, t_v, edge_pair_idx, pos_u, pos_v, dx, weights, totals, t_counts, t_indices
                 pbar.update(len(chunk_pairs))
 
+        # Final cleanup
+        del all_positions
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return distance_matrix
+
 
     def _recompute_path_distances_with_gradients(self,
                                                paths: dict,

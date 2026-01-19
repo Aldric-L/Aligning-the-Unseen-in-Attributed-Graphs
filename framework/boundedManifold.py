@@ -426,7 +426,7 @@ class BoundedManifold:
     def plot_on_manifold_grid(self, function: Callable[[torch.Tensor], float], name: str,
             data_points: Union[torch.Tensor, None] = None, labels: Union[torch.Tensor, None] = None,
             z_range: Union[Tuple[float, float], torch.Tensor, None] = None, 
-            resolution: int = 30, require_full_grid=True):
+            resolution: int = 30, require_full_grid: bool=True, plot: bool=True):
         
         if self.get_dimension() != 2:
             raise ValueError("Visualization is supported only for 2D manifolds.")
@@ -457,18 +457,23 @@ class BoundedManifold:
             
             # Convert to numpy for plotting
             curvature_np = values.cpu().numpy()
-            self._plot_manifold_grid(curvature_np, Z1_np, Z2_np, latent_points=data_points, labels=labels, name=name)
+            if plot:
+                self._plot_manifold_grid(curvature_np, Z1_np, Z2_np, latent_points=data_points, labels=labels, name=name)
+            return curvature_np
         
     def visualize_manifold_curvature(self, z_range: Union[Tuple[float, float], torch.Tensor, None] = None, resolution: int = 30,
                                      data_points: Union[torch.Tensor, None] = None, labels: Union[torch.Tensor, None] = None,
-                                     h_curvature: float = 1e-3, exact_mode: bool = False):
+                                     h_curvature: float = 1e-3, exact_mode: bool = False,
+                                     return_data: bool = False, plot: bool = True):
         
         def curvature_func(z: torch.Tensor) -> float:
             return torch.log(self.compute_true_gaussian_curvature(z, h=h_curvature) +1e-8) if exact_mode else self.compute_gaussian_curvature(self.metric_tensor(z))
 
-        self.plot_on_manifold_grid(curvature_func, "Gaussian Curvature",
-                                   data_points=data_points, labels=labels, z_range=z_range,
-                                   resolution=resolution, require_full_grid=True)
+        r = self.plot_on_manifold_grid(curvature_func, "Gaussian Curvature",
+                                          data_points=data_points, labels=labels, z_range=z_range,
+                                          resolution=resolution, require_full_grid=True, plot=plot)
+        if return_data:
+            return r
 
     @staticmethod
     def hypercube_bounds(
