@@ -180,3 +180,5 @@ data/
 old_utils/
 
 *.pth
+archive/
+models/

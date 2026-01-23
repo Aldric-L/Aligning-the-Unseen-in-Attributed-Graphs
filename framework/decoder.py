@@ -8,8 +8,10 @@ from tqdm import tqdm
 from torch.autograd.functional import jacobian
 import weakref
 import time
+from torch_geometric.nn import GCNConv
 
 from framework.preprocessing import PreprocessingLayer
+from framework.utils import get_adjacency_matrix_from_tensors
 from framework.autograd import _mlp_forward_with_jacobian
 
 class DecoderBase(nn.Module, ABC):
@@ -563,143 +565,6 @@ class NodeAttributeVariationalDecoder(DecoderBase):
             + lambda_comp_variance    * comp_var_pen
             + lambda_decoder_variance * dec_var_pen
         )
-
-        
-    # def compute_jacobian(
-    #     self, 
-    #     z: torch.Tensor, 
-    #     node_idx: Optional[int] = None,
-    # ) -> torch.Tensor:
-    #     """
-    #     Compute Jacobian of the sampled output w.r.t. z:
-    #       recon = mu(z) + sigma(z) * eps
-    #     so J = J_mu + J_sigma.
-    #     """
-    #     # detach input
-    #     z0 = z.detach()
-    #     with torch.no_grad():
-    #         outputs = self.forward(z0, sample=True)
-    #         mu     = outputs["node_features_mu"]
-    #         logvar = outputs["node_features_logvar"]
-    #         recon  = outputs["node_features"]
-        
-    #     def f_mu(z_in):
-    #         return self.forward(z_in, sample=False)["node_features_mu"]
-        
-    #     def f_sigma(z_in):
-    #         lv = self.forward(z_in, sample=False)["node_features_logvar"]
-    #         return torch.exp(0.5 * lv)
-        
-    #     if node_idx is not None or z0.ndim == 1:
-    #         # single node
-    #         idx = 0 if z0.ndim == 1 else node_idx
-    #         z_node = z0[idx].requires_grad_(True)
-
-    #         J_mu    = jacobian(lambda zz: f_mu(z0.clone().scatter(0, idx, zz))[idx], z_node)
-    #         J_sigma = jacobian(lambda zz: f_sigma(z0.clone().scatter(0, idx, zz))[idx], z_node)
-
-    #         # J = J_mu + J_sigma
-    #         return J_mu + J_sigma
-
-    #     else:
-    #         # full batch
-    #         z0 = z0.requires_grad_(True)
-    #         J_mu_full    = jacobian(f_mu,    z0, vectorize=True)
-    #         J_sigma_full = jacobian(f_sigma, z0, vectorize=True)
-    #         # both have shape [N, out_dim, N, latent_dim]
-
-    #         N, D, _, L = J_mu_full.shape
-    #         idx = torch.arange(N, device=J_mu_full.device)      # [N]
-    #         # J_mu_full[idx, :, idx, :] has shape [N, D, L]
-    #         return J_mu_full[idx, :, idx, :] + J_sigma_full[idx, :, idx, :]
-
-    # def compute_jacobian(self, z: torch.Tensor,  node_idx: Optional[int] = None, chunk_size: int = 32):
-    #     N = z.size(0)
-    #     results = []
-        
-    #     for start in range(0, N, chunk_size):
-    #         end = min(start + chunk_size, N)
-    #         chunk_result = self._compute_jacobian(z[start:end], node_idx=node_idx)
-    #         results.append(chunk_result)
-        
-    #     return torch.cat(results, dim=0)
-
-    # def _compute_jacobian(self, z: torch.Tensor, node_idx: Optional[int] = None) -> torch.Tensor:
-    #     """
-    #     Optimized: compute jacobian of recon = mu + sigma * eps
-    #     by computing J_h once for the shared mlp features h = self.mlp(z).
-    #     Assumes mean_head and logvar_head are nn.Linear layers.
-    #     """
-    #     # detach input for the reference recon etc.
-    #     z0 = z.detach()
-    #     with torch.no_grad():
-    #         outputs = self.forward(z0, sample=True)
-    #         mu     = outputs["node_features_mu"]
-    #         logvar = outputs["node_features_logvar"]
-    #         recon  = outputs["node_features"]
-
-    #     W_mu = self.mean_head.weight      # [D, H]
-    #     b_mu = self.mean_head.bias
-    #     W_lv = self.logvar_head.weight    # [D, H]
-    #     b_lv = self.logvar_head.bias
-
-    #     def f_h(z_in):
-    #         # return pre-head features h for each node
-    #         # ensure shape: (N, H) for batch input, (1,H) if single vector
-    #         return self.mlp(z_in)
-
-    #     if node_idx is not None or z0.ndim == 1:
-    #         # single node case
-    #         idx = 0 if z0.ndim == 1 else node_idx
-    #         z_node = z0[idx].requires_grad_(True)  # shape [L]
-
-    #         # jacobian of h wrt this node's latent z: shape [H, L]
-    #         J_h = jacobian(lambda zz: f_h(zz.unsqueeze(0))[0], z_node, create_graph=False)  # [H, L]
-
-    #         # compute mu and sigma at this node
-    #         h_node = f_h(z0[idx:idx+1])[0]                # [H]
-    #         lv_node = (W_lv @ h_node) + b_lv              # [D]
-    #         sigma_node = torch.exp(0.5 * lv_node)         # [D]
-
-    #         # J_mu = W_mu @ J_h  -> [D, L]
-    #         J_mu = W_mu @ J_h
-
-    #         # factor = 0.5 * sigma[:,None] * W_lv  -> [D, H]
-    #         factor = 0.5 * sigma_node[:, None] * W_lv      # broadcast
-
-    #         # J_sigma = factor @ J_h -> [D, L]
-    #         J_sigma = factor @ J_h
-
-    #         return J_mu + J_sigma
-
-    #     else:
-    #         # full-batch: compute J_h once vectorized
-    #         z0 = z0.requires_grad_(True)   # shape [N, L]
-
-    #         # J_h_full: [N, H, N, L] (vectorize=True often reduces memory/time)
-    #         J_h_full = jacobian(f_h, z0, vectorize=True, create_graph=False)
-
-    #         N, H, _, L = J_h_full.shape
-    #         idx = torch.arange(N, device=J_h_full.device)
-
-    #         # extract diagonal blocks: [N, H, L]
-    #         J_h = J_h_full[idx, :, idx, :]
-
-    #         # compute h, lv, sigma for each node (N,H), (N,D), (N,D)
-    #         h = f_h(z0)                       # [N, H]
-    #         lv = torch.matmul(h, W_lv.t()) + b_lv  # [N, D]
-    #         sigma = torch.exp(0.5 * lv)             # [N, D]
-
-    #         # J_mu: einsum 'dh,nhl->ndl'  -> [N, D, L]
-    #         J_mu = torch.einsum('dh,nhl->ndl', W_mu, J_h)
-
-    #         # factor per node: [N, D, H] = 0.5 * sigma[:, :, None] * W_lv[None, :, :]
-    #         factor = 0.5 * sigma.unsqueeze(2) * W_lv.unsqueeze(0)  # [N, D, H]
-
-    #         # J_sigma: einsum 'ndh,nhl->ndl' -> [N, D, L]
-    #         J_sigma = torch.einsum('ndh,nhl->ndl', factor, J_h)
-
-    #         return J_mu + J_sigma
         
     def compute_jacobian(self, z: torch.Tensor, node_idx: Optional[int] = None, mode="total") -> torch.Tensor:
         """Ultra-fast analytical jacobian - no autodiff needed"""
@@ -773,142 +638,200 @@ class NodeAttributeVariationalDecoder(DecoderBase):
                 print(f"Is full rank? {'✅ Yes' if is_full_rank else '❌ No'}")
                 print("-" * 30)
         return total_is_full_rank
+    
 
-class LatentDistanceDecoder(DecoderBase):
+
+class InnerProductAdjacencyDecoder(DecoderBase):
     """
-    Fictive decoder that outputs latent codes but computes a meaningful loss 
-    based on pairwise distances between connected nodes using Jacobian-based metrics.
+    Standard inner-product decoder for Variational Graph Autoencoders (VGAE).
+    Reconstructs the adjacency matrix A via A_hat = sigmoid(Z * Z^T).
+    """
+    def __init__(self, latent_dim: int, name: str = "adj_decoder", dropout: float = 0.0):
+        super(InnerProductAdjacencyDecoder, self).__init__(latent_dim, name)
+        self.dropout = dropout
+
+    def forward(self, z: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+        """
+        Computes the reconstructed adjacency logits.
+
+        Args:
+            z: Latent embeddings [num_nodes, latent_dim]
+
+        Returns:
+            Dict containing:
+                - 'adj_logits': Raw logits (Z * Z^T) [num_nodes, num_nodes]
+                - 'adj_probs': Sigmoid probabilities [num_nodes, num_nodes]
+        """
+        # Apply dropout to Z if configured (rare in vanilla VGAE but sometimes useful)
+        z = F.dropout(z, self.dropout, training=self.training)
+        
+        # Standard inner product decoder: Z * Z^T
+        adj_logits = torch.matmul(z, z.t())
+        
+        return {
+            'adj_logits': adj_logits,
+            'adj_probs': torch.sigmoid(adj_logits)
+        }
+
+    def compute_loss(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
+                     pos_weight: float = 1.0, norm: float = 1.0) -> Dict[str, torch.Tensor]:
+        """
+        Computes binary cross entropy loss for adjacency reconstruction.
+        
+        Note: The standard VGAE loss usually weights the positive examples (edges) 
+        higher because graphs are sparse.
+        
+        Args:
+            outputs: Must contain 'adj_logits'
+            targets: Must contain 'adj_matrix' (dense or sparse)
+            pos_weight: Weight for positive class (edges) to handle sparsity.
+                        Usually calculated as: (num_nodes^2 - num_edges) / num_edges
+            norm: Normalization factor for the loss.
+                  Usually calculated as: num_nodes^2 / ((num_nodes^2 - num_edges) * 2)
+
+        Returns:
+            Dict with 'final_loss' and 'bce_loss'.
+        """
+        adj_logits = outputs['adj_logits']
+
+        if "edge_index" in targets:
+            target_adj = get_adjacency_matrix_from_tensors(targets["edge_index"], targets["edge_labels"])
+        elif "adj_matrix" in targets:
+            target_adj = targets["adj_matrix"]
+        else:
+            raise ValueError("Targets must contain either 'edge_index' or 'adj_matrix'")
+        
+        # Ensure target is dense for BCEWithLogitsLoss
+        if target_adj.is_sparse:
+            target_adj = target_adj.to_dense()
+
+        # Handle pos_weight as a tensor for PyTorch API compatibility
+        if not isinstance(pos_weight, torch.Tensor):
+            pos_weight_tensor = torch.tensor([pos_weight], device=adj_logits.device)
+        else:
+            pos_weight_tensor = pos_weight
+
+        # Weighted Binary Cross Entropy with Logits
+        # We multiply by norm (as per Kingma/Welling) to keep scale consistent with KL
+        loss = norm * F.binary_cross_entropy_with_logits(
+            adj_logits, 
+            target_adj, 
+            pos_weight=pos_weight_tensor
+        )
+        
+        return {
+            'final_loss': loss,
+            'bce_unweighted': loss / norm  # Useful for debugging unscaled loss
+        }
+    
+class GraphGCNDecoder(DecoderBase):
+    """
+    GCN-based Decoder for Variational Graph Autoencoders (VGAE).
+    
+    Unlike the standard inner-product decoder (which reconstructs Adjacency A),
+    a GCN decoder is typically used to reconstruct Node Features (X) by 
+    propagating the latent variables Z over the graph structure.
+    
+    Forward Path: Z, Edge_Index -> GCN Layers -> X_hat
     """
     def __init__(
         self, 
-        latent_dim: int,
-        distance_mode: str = "linear_interpolation",  # or "direct"
-        num_integration_points: int = 25,
-        metric_regularization: float = 1e-6,
-        name: str = "latent_distance_decoder"
+        latent_dim: int, 
+        hidden_dims: List[int], 
+        output_dim: int, 
+        name: str = "node_attr_decoder", 
+        dropout: float = 0.0,
+        activation: nn.Module = nn.ReLU()
     ):
-        super(LatentDistanceDecoder, self).__init__(latent_dim, name)
+        """
+        Args:
+            latent_dim: Dimension of input latent embeddings (Z)
+            hidden_dims: List of hidden dimensions for the decoder layers.
+                         Typically the reverse of the encoder.
+            output_dim: Dimension of the original node features (X) to reconstruct.
+            dropout: Dropout probability.
+            activation: Activation function.
+        """
+        super(GraphGCNDecoder, self).__init__(latent_dim, name)
+        self.output_dim = output_dim
+        self.dropout = dropout
+        self.activation = activation
         
-        self.distance_mode = distance_mode
-        self.num_integration_points = num_integration_points
-        self.metric_regularization = metric_regularization
-        self.model = None  # Weak reference to the model instance
-
-    def giveVAEInstance(self, model):
-        self.model = weakref.ref(model)
-
-    def forward(self, z: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
-        """Forward pass - simply returns the latent codes (fictive decoder)"""
-        return {"latent_codes": z.clone()}
+        self.gcn_layers = nn.ModuleList()
         
-    def _riemannian_distance(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-        #print(f"[riemannian_distance] Computing pairwise distances for batch size {z.shape[0]}")
-        #start_time = time.time()
-        if self.model is None or self.model() is None:
-            raise ValueError("Model instance not set. Call giveVAEInstance(model) first.")
-        model = self.model()
+        # Build decoder layers (Latent -> Hidden -> ... -> Output)
+        in_channels = latent_dim
+        
+        # Add hidden layers
+        for hidden_dim in hidden_dims:
+            self.gcn_layers.append(GCNConv(in_channels, hidden_dim))
+            in_channels = hidden_dim
+            
+        # Final reconstruction layer mapping to original feature space
+        self.final_layer = GCNConv(in_channels, output_dim)
 
-        distances = []
-        if z1.ndim == 1:
-            z1 = z1.unsqueeze(0)
-        if z2.ndim == 1:
-            z2 = z2.unsqueeze(0)
-        for i, (u_vec, v_vec) in enumerate(zip(z1, z2)):
-            if self.distance_mode == "linear_interpolation":
-                #d = DistanceApproximations.linear_interpolation_distance(model.get_latent_manifold(), u_vec, v_vec, 
-                #                                                         num_points=self.num_integration_points)
-                d = model.get_latent_manifold().linear_interpolation_distance(u_vec, v_vec, 
-                                                                                num_points=self.num_integration_points)
-            else:
-                d = model.get_latent_manifold().exact_geodesic_distance(u_vec, v_vec)
-            #print(f"  [distance] Sample {i}: {d.item():.4f}")
-            distances.append(d)
-        #print(f"[riemannian_distance] Done in {time.time() - start_time:.4f}s")
-        return torch.stack(distances)
-    
-    def compute_loss(
-                self,
-                outputs: Dict[str, torch.Tensor],
-                targets: Dict[str, torch.Tensor],
-                negative_distance_weight: float = 1.0,
-            ) -> torch.Tensor:
-        if self.model is None or self.model() is None:
-            raise ValueError("Model instance not set. Call giveVAEInstance(model) first.")
+    def forward(self, z: torch.Tensor, edge_index: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+        """
+        Reconstructs node features using the latent embeddings and graph topology.
 
-        z = outputs["latent_codes"]   # (N, D)
-        N = z.size(0)
-        # Removed: batched_dist = torch.vmap(self._riemannian_distance, in_dims=(0,0), out_dims=0)
+        Args:
+            z: Latent embeddings [num_nodes, latent_dim]
+            edge_index: Graph connectivity [2, num_edges] (Required for GCN)
 
-        pos_pairs = []
-        pos_weights = []
+        Returns:
+            Dict containing:
+                - 'recon_features': Reconstructed node features [num_nodes, output_dim]
+        """
+        x = z
+        
+        # Iterate through hidden GCN layers
+        for layer in self.gcn_layers:
+            x = layer(x, edge_index)
+            x = self.activation(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Final projection to feature space
+        # Note: We usually don't apply activation/dropout to the final reconstruction 
+        # unless features are bounded (e.g., sigmoid for binary features)
+        recon_x = self.final_layer(x, edge_index)
+        
+        return {
+            'recon_features': recon_x
+        }
 
-        if "edge_index" in targets:
-            src, dst = targets["edge_index"]
-            edge_labels = targets.get("edge_labels", None)
-            for idx, (i, j) in enumerate(zip(src.tolist(), dst.tolist())):
-                if i == j:
-                    continue
-                w = edge_labels[idx].item() if edge_labels is not None else 1.0
-                if w > 0:
-                    pos_pairs.append((i, j))
-                    pos_weights.append(w)
+    def compute_loss(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], 
+                     **kwargs) -> Dict[str, torch.Tensor]:
+        """
+        Computes Mean Squared Error (MSE) for feature reconstruction.
 
-        elif "adj_matrix" in targets:
-            A = targets["adj_matrix"]
-            ui, uj = torch.triu_indices(N, N, offset=1)
-            weights = A[ui, uj]
-            mask = weights > 0
-            for i, j, w in zip(ui[mask].tolist(), uj[mask].tolist(), weights[mask].tolist()):
-                pos_pairs.append((i, j))
-                pos_weights.append(w)
+        Args:
+            outputs: Must contain 'recon_features'
+            targets: Must contain 'node_features' (the original X)
 
+        Returns:
+            Dict with 'final_loss' and 'mse_loss'.
+        """
+        if 'recon_features' not in outputs:
+            raise ValueError("GCN Decoder outputs must contain 'recon_features'")
+            
+        recon_x = outputs['recon_features']
+        
+        if 'node_features' in targets:
+            target_x = targets['node_features']
+        elif 'x' in targets:
+            target_x = targets['x']
         else:
-            raise ValueError("Targets must contain either 'edge_index' or 'adj_matrix'")
+            raise ValueError("Targets must contain 'node_features' or 'x' for GCN decoding.")
 
-        # Batch positive distances
-        if pos_pairs:
-            pos_pairs = torch.tensor(pos_pairs, device=z.device)
-            pos_weights = torch.tensor(pos_weights, device=z.device)
-            z_i = z[pos_pairs[:,0]]
-            z_j = z[pos_pairs[:,1]]
-            # Directly call _riemannian_distance (it handles its own batching)
-            pos_dists = self._riemannian_distance(z_i, z_j) 
-            total_pos   = (pos_weights * pos_dists).sum()
-            sum_weights = pos_weights.sum()
-            pos_loss    = total_pos / sum_weights
-        else:
-            pos_loss    = torch.tensor(0.0, device=z.device, requires_grad=True)
-            sum_weights = 1.0
+        # Compute MSE Loss
+        loss = F.mse_loss(recon_x, target_x)
+        
+        return {
+            'final_loss': loss,
+            'mse_loss': loss
+        }
 
-        # Build non-edge mask & sample negatives
-        mask_nonedge = torch.ones((N, N), dtype=torch.bool, device=z.device)
-        if pos_pairs.numel() > 0:
-            mask_nonedge[pos_pairs[:,0], pos_pairs[:,1]] = False
-            mask_nonedge[pos_pairs[:,1], pos_pairs[:,0]] = False
-        mask_nonedge.fill_diagonal_(False)
-
-        if negative_distance_weight > 0:
-            num_neg = len(pos_pairs) if "edge_index" in targets else int((targets["adj_matrix"] != 0).sum().item() / 2)
-            all_pairs = torch.nonzero(mask_nonedge, as_tuple=False)
-            idxs      = torch.randint(0, all_pairs.size(0), (num_neg,), device=z.device)
-            neg_pairs = all_pairs[idxs]
-
-            z_i_neg = z[neg_pairs[:,0]]
-            z_j_neg = z[neg_pairs[:,1]]
-            # Directly call _riemannian_distance
-            neg_dists = self._riemannian_distance(z_i_neg, z_j_neg)
-
-            neg_penalties = 1.0 / (1.0 + neg_dists**2)
-
-            neg_loss   = negative_distance_weight * neg_penalties.mean()
-        else:
-            neg_loss = torch.tensor(0.0, device=z.device, requires_grad=True)
-        total_loss = pos_loss + neg_loss
-
-        print(f"Loss: pos={pos_loss.item():.4f}, neg={neg_loss.item():.4f}, total={total_loss.item():.4f}")
-        return total_loss
-
-from framework.geometry import compute_heat_kernel_from_laplacian, compute_heat_kernel_divergence, compute_graph_laplacian, compute_graph_laplacian_from_targets, compute_sigma_with_knn, compute_manifold_laplacian, check_heat_kernels_informativeness_fast, compute_heat_time_scale_from_laplacian
+from framework.geometry import compute_graph_laplacian_from_targets
 
 
 class ManifoldHeatKernelDecoder(DecoderBase):

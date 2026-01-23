@@ -2,8 +2,6 @@ import torch
 import numpy as np
 from scipy.spatial.distance import cosine # For cosine similarity
 
-from framework.GraphVAE import GraphVAE
-
 def adj_matrix_to_edge_index(adj_matrix):
     """
     Convert an adjacency matrix to edge index format for PyTorch Geometric.
@@ -218,7 +216,7 @@ def compute_node_feature_assortativity(G, node_features):
 
     return node_assortativity_scores
 
-def compute_curvature_change(model1: GraphVAE, model2: GraphVAE):
+def compute_curvature_change(model1, model2):
     model1.get_latent_manifold().compute_full_grid_metric_tensor()
     model2.get_latent_manifold().compute_full_grid_metric_tensor()
     resolution = 30
