@@ -1,7 +1,7 @@
-# Aligning the Unseen in Attributed Graphs: Interplay between Graph Geometry and Node Attributes Manifold
-## Code by Anonymous author @ Anonymous institution (2025-2026)
+# Geometric misalignment between topology and node attributes reveals structure in complex networks}
+## Code by Aldric Labarthe @ ENS Paris-Saclay (2025-2026)
 
-This repository hosts all experiments that support the paper *Aligning the Unseen in Attributed Graphs: Interplay between Graph Geometry and Node Attributes Manifold* from Anonymous authors. Data and models weights are not included due to their size but are available upon reasonable request to the corresponding author.
+This repository hosts all experiments that support the paper *Geometric misalignment between topology and node attributes reveals structure in complex networks}* from Aldric Labarthe *et al*. Data and models weights are not included due to their size but are available upon reasonable request to the corresponding author.
 
 All the framework is written in Obect-Oriented style and is based on PyTorch.
 
