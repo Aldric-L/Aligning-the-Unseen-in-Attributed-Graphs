@@ -176,9 +176,8 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# data, run outputs and generated figures/tables are not versioned
 data/
-old_utils/
-
+results/
+outputs/
 *.pth
-archive/
-models/
